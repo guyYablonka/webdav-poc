@@ -1,0 +1,26 @@
+{
+  "name": "@office-dav/dav-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Stateless WebDAV front end for Office desktop. Talks only to a Gateway API (/gw/v1).",
+  "main": "src/main.ts",
+  "scripts": {
+    "dev": "tsx watch --clear-screen=false --env-file-if-exists=../../.env src/main.ts",
+    "start": "tsx --env-file-if-exists=../../.env src/main.ts",
+    "build": "node build.mjs",
+    "start:dist": "node dist/main.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@office-dav/gateway-contract": "*",
+    "@xmldom/xmldom": "^0.9.12",
+    "fastify": "^5.12.7",
+    "pino": "^10.4.0",
+    "undici": "^8.12.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}

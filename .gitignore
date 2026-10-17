@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/
+.env
+*.log
+certs/*
+!certs/.gitkeep
+!certs/README.md
