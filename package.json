@@ -22,7 +22,8 @@
     "test:unit": "npm run test -w packages/gateway-contract -w services/dav-service -w apps/demo-site",
     "test:integration": "npm run test -w test",
     "build": "npm run build -w services/dav-service",
-    "office-trace": "node scripts/office-trace.mjs"
+    "office-trace": "node scripts/office-trace.mjs",
+    "make-big-xlsx": "node scripts/make-big-xlsx.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

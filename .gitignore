@@ -6,3 +6,4 @@ data/
 certs/*
 !certs/.gitkeep
 !certs/README.md
+/big-*.xlsx
