@@ -35,7 +35,8 @@ export interface ContentStream {
 }
 
 export interface PutContentOptions {
-  lockToken: string;
+  /** The token from the If header. Absent when Office saved without one (the gateway decides). */
+  lockToken: string | undefined;
   contentLength: number | undefined;
 }
 
@@ -45,6 +46,12 @@ export interface GatewayClient {
   getFile(fileId: string, ctx: CallContext): Promise<FileInfo>;
   getContent(fileId: string, ctx: CallContext): Promise<ContentStream>;
   putContent(fileId: string, body: Readable, opts: PutContentOptions, ctx: CallContext): Promise<PutContentResponse>;
+  /** A file this session created with Save As, or null. */
+  findSessionFile(sessionId: string, name: string, ctx: CallContext): Promise<FileInfo | null>;
+  /** Save As: a PUT to a new name in the session's collection. */
+  saveAs(sessionId: string, name: string, body: Readable, opts: { contentLength: number | undefined }, ctx: CallContext): Promise<PutContentResponse>;
+  /** Keeps the body of a save whose token no longer resolves. */
+  quarantine(token: string, name: string, body: Readable, opts: { contentLength: number | undefined }, ctx: CallContext): Promise<void>;
   lock(req: LockRequest, ctx: CallContext): Promise<LockResponse>;
   unlock(lockToken: string, ctx: CallContext): Promise<void>;
   close(): Promise<void>;
@@ -133,13 +140,54 @@ export class HttpGatewayClient implements GatewayClient {
     ctx: CallContext,
   ): Promise<PutContentResponse> {
     const path = GatewayPaths.content(fileId);
-    const headers: Record<string, string> = {
-      'content-type': 'application/octet-stream',
-      [GatewayHeaders.lockToken]: opts.lockToken,
-    };
+    const headers: Record<string, string> = { 'content-type': 'application/octet-stream' };
+    if (opts.lockToken) headers[GatewayHeaders.lockToken] = opts.lockToken;
     if (opts.contentLength !== undefined) headers['content-length'] = String(opts.contentLength);
     const res = await this.send('PUT', path, ctx, { body, headers });
     return this.parse(res, 'PUT', path, PutContentResponse, 201);
+  }
+
+  async findSessionFile(sessionId: string, name: string, ctx: CallContext): Promise<FileInfo | null> {
+    const path = GatewayPaths.sessionFile(sessionId, name);
+    const res = await this.send('GET', path, ctx);
+    if (res.statusCode === 404) {
+      await res.body.dump();
+      return null;
+    }
+    return this.parse(res, 'GET', path, FileInfo, 200);
+  }
+
+  async saveAs(
+    sessionId: string,
+    name: string,
+    body: Readable,
+    opts: { contentLength: number | undefined },
+    ctx: CallContext,
+  ): Promise<PutContentResponse> {
+    const path = GatewayPaths.sessionFileContent(sessionId, name);
+    const headers: Record<string, string> = { 'content-type': 'application/octet-stream' };
+    if (opts.contentLength !== undefined) headers['content-length'] = String(opts.contentLength);
+    const res = await this.send('PUT', path, ctx, { body, headers });
+    return this.parse(res, 'PUT', path, PutContentResponse, 201);
+  }
+
+  async quarantine(
+    token: string,
+    name: string,
+    body: Readable,
+    opts: { contentLength: number | undefined },
+    ctx: CallContext,
+  ): Promise<void> {
+    const path = GatewayPaths.quarantine;
+    const headers: Record<string, string> = {
+      'content-type': 'application/octet-stream',
+      [GatewayHeaders.davToken]: token,
+      [GatewayHeaders.davFileName]: encodeURIComponent(name),
+    };
+    if (opts.contentLength !== undefined) headers['content-length'] = String(opts.contentLength);
+    const res = await this.send('PUT', path, ctx, { body, headers });
+    if (res.statusCode !== 201) throw await this.toError(res, 'PUT', path);
+    await res.body.dump();
   }
 
   lock(req: LockRequest, ctx: CallContext): Promise<LockResponse> {

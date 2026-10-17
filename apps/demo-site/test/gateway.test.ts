@@ -141,7 +141,7 @@ describe('gateway endpoints', () => {
     expect(res.statusCode).toBe(401);
   });
 
-  it('refuses a PUT without a lock before reading the body', async () => {
+  it('keeps a PUT without a lock as a conflict version (Office drops refused saves)', async () => {
     const cookie = await login('alice');
     const { token } = await editSession(cookie);
     const session = ResolveResponse.parse((await resolve(token)).body);
@@ -151,7 +151,43 @@ describe('gateway endpoints', () => {
       headers: { ...auth, 'x-dav-session': session.sessionId, 'content-type': 'application/octet-stream' },
       payload: Buffer.from('x'),
     });
-    expect(res.statusCode).toBe(423);
+    expect(res.statusCode).toBe(201);
+    expect(res.json()).toMatchObject({ kind: 'conflict', fileId });
+  });
+
+  it('creates a Save As file through the session files route', async () => {
+    const cookie = await login('alice');
+    const { token } = await editSession(cookie);
+    const session = ResolveResponse.parse((await resolve(token)).body);
+    const headers = { ...auth, 'x-dav-session': session.sessionId };
+    const name = encodeURIComponent('Plan copy.docx');
+    expect((await demo.app.inject({ method: 'GET', url: gw(`/sessions/${session.sessionId}/files/${name}`), headers })).statusCode).toBe(404);
+    const put = await demo.app.inject({
+      method: 'PUT',
+      url: gw(`/sessions/${session.sessionId}/files/${name}/content`),
+      headers: { ...headers, 'content-type': 'application/octet-stream' },
+      payload: Buffer.from('copy'),
+    });
+    expect(put.statusCode).toBe(201);
+    expect(put.json()).toMatchObject({ kind: 'current', created: true });
+    const found = await demo.app.inject({ method: 'GET', url: gw(`/sessions/${session.sessionId}/files/${name}`), headers });
+    expect(found.json()).toMatchObject({ fileId: put.json().fileId, name: 'Plan copy.docx' });
+  });
+
+  it('quarantines by token only for a known, revoked token', async () => {
+    const cookie = await login('alice');
+    const { token } = await editSession(cookie);
+    const session = ResolveResponse.parse((await resolve(token)).body);
+    demo.policy.revokeSession(session.sessionId);
+    const send = (t: string) =>
+      demo.app.inject({
+        method: 'PUT',
+        url: gw('/quarantine'),
+        headers: { ...auth, 'content-type': 'application/octet-stream', 'x-dav-token': t, 'x-dav-file-name': 'Plan.docx' },
+        payload: Buffer.from('late'),
+      });
+    expect((await send(token)).statusCode).toBe(201);
+    expect((await send('not-a-token')).statusCode).toBe(401);
   });
 
   it('validates request bodies', async () => {

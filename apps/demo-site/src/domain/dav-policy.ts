@@ -2,12 +2,28 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { Intent, LockRequest, LockResponse, ResolveResponse } from '@office-dav/gateway-contract';
 import type { EventBus } from '../events/bus.js';
 import type { StoredBlob } from '../storage/blob-store.js';
-import type { LockRow, Repo, SessionRow, VersionRow } from '../storage/repo.js';
+import type { LockRow, QuarantineRow, Repo, SessionRow, VersionRow } from '../storage/repo.js';
 import { PolicyError, notFound, sessionInvalid } from './errors.js';
 import type { Permissions } from './permissions.js';
 
 /** Milliseconds since the epoch. Injected so tests can move time. */
 export type Clock = () => number;
+
+/** Where a DAV save goes. See SaveKind in the gateway contract. */
+export type SavePlan =
+  | { kind: 'current'; lock: LockRow; revived: boolean }
+  | { kind: 'conflict'; reason: string }
+  | { kind: 'quarantined'; reason: string };
+
+export type SaveAsPlan =
+  | { kind: 'existing'; fileId: string }
+  | { kind: 'new' }
+  | { kind: 'quarantined'; reason: string };
+
+export type DavWriteResult =
+  | { kind: 'current'; version: VersionRow; revived: boolean }
+  | { kind: 'conflict'; version: VersionRow; reason: string; revived: false }
+  | { kind: 'quarantined'; id: string; reason: string; revived: false };
 
 export interface PolicyConfig {
   /** Backstop lifetime of a session token (TOKEN_MAX_AGE_S). */
@@ -95,32 +111,42 @@ export class DavPolicy {
     };
   }
 
-  /** Loads a session for a gateway call: it must exist, be live, and (if given) belong to `fileId`. */
+  /**
+   * Loads a session for a gateway call: it must exist, be live, and (if given)
+   * cover `fileId`, meaning its own file or a file it created with Save As.
+   */
   requireSession(sessionId: string, fileId?: string): SessionRow {
     const session = this.repo.getSession(sessionId);
     if (!session) throw sessionInvalid('unknown');
     this.assertLive(session);
-    if (fileId !== undefined && session.file_id !== fileId) {
+    if (fileId !== undefined && !this.covers(session, fileId)) {
       throw new PolicyError(403, 'forbidden', 'the DAV session is for another file');
     }
     return session;
   }
 
-  /** Revokes a session and releases any lock it holds. Returns false if it was already revoked. */
+  /** Loads a session row whatever its state (for attributing quarantined saves). */
+  requireSessionRow(sessionId: string): SessionRow {
+    const session = this.repo.getSession(sessionId);
+    if (!session) throw sessionInvalid('unknown');
+    return session;
+  }
+
+  /** Revokes a session and releases every lock it holds. Returns false if it was already revoked. */
   revokeSession(sessionId: string): boolean {
     const now = this.clock();
     const outcome = this.repo.transaction(() => {
       const session = this.repo.getSession(sessionId);
       if (!session || session.revoked_at !== null) return null;
       this.repo.revokeSession(sessionId, now);
-      const lock = this.repo.getLockBySession(sessionId);
-      if (lock) this.repo.deleteLock(lock.file_id);
-      return { session, lock };
+      const locks = this.repo.listLocksBySession(sessionId);
+      for (const lock of locks) this.repo.deleteLock(lock.file_id);
+      return { session, locks };
     });
     if (!outcome) return false;
-    const { session, lock } = outcome;
+    const { session, locks } = outcome;
     this.events.publish({ type: 'session.revoked', fileId: session.file_id, userId: session.user_id, sessionId, at: iso(now) });
-    if (lock) {
+    for (const lock of locks) {
       this.events.publish({ type: 'lock.released', fileId: lock.file_id, userId: lock.user_id, reason: 'session_revoked', at: iso(now) });
     }
     return true;
@@ -147,6 +173,7 @@ export class DavPolicy {
 
   acquireLock(req: Omit<LockRequest, 'lockToken'>): LockResponse {
     const timeoutS = this.grantTimeout(req.timeoutS);
+    let tookOverFrom: string | undefined;
     const lock = this.repo.transaction(() => {
       const session = this.requireSession(req.sessionId, req.fileId);
       this.requireWriter(session);
@@ -154,7 +181,15 @@ export class DavPolicy {
       if (!file?.current_version_id) throw notFound('file');
       const now = this.clock();
       const existing = this.repo.getLock(req.fileId);
-      if (existing && existing.expires_at > now) throw this.lockedBy(existing);
+      if (existing && existing.expires_at > now) {
+        // Same-user takeover: after Office crashes, the user's next "Edit" is a
+        // new session while the dead one still holds the lock. Refusing meant
+        // Word told the user the file was "locked by another user" (their own
+        // lock) for up to the lock timeout. If the old session is in fact still
+        // alive, its next save becomes a conflict version, so nothing is lost.
+        if (existing.user_id !== session.user_id || existing.session_id === session.id) throw this.lockedBy(existing);
+        tookOverFrom = existing.session_id;
+      }
       if (existing) this.repo.deleteLock(req.fileId);
       const lock: LockRow = {
         file_id: req.fileId,
@@ -178,6 +213,7 @@ export class DavPolicy {
       sessionId: lock.session_id,
       expiresAt: iso(lock.expires_at),
       at: iso(lock.created_at),
+      ...(tookOverFrom ? { tookOverFrom } : {}),
     });
     return { lockToken: lock.lock_token, expiresAt: iso(lock.expires_at), timeoutS, revived: false };
   }
@@ -221,7 +257,7 @@ export class DavPolicy {
     }
   }
 
-  /** Admin action. The holder's next save fails with 412 because its token no longer matches. */
+  /** Admin action. The holder's next save becomes a conflict version because its token no longer matches. */
   forceUnlock(fileId: string): boolean {
     const now = this.clock();
     const released = this.repo.transaction(() => {
@@ -244,36 +280,45 @@ export class DavPolicy {
   // Saves
   // -------------------------------------------------------------------------
 
-  /** Fast check before a DAV upload is streamed into storage. */
-  checkDavWrite(fileId: string, sessionId: string, lockToken: string | undefined): void {
-    const session = this.requireSession(sessionId, fileId);
-    this.requireWriter(session);
-    const now = this.clock();
-    if (!lockToken) {
-      const lock = this.repo.getLock(fileId);
-      if (lock && lock.expires_at > now) throw this.lockedBy(lock);
-      throw new PolicyError(423, 'locked', 'saving requires a lock');
-    }
-    this.checkLockForWrite(fileId, session.id, lockToken, now);
+  /**
+   * Where a DAV save will go, decided before the body is read. Never refuses a
+   * known session: Office treats any refusal as success and drops the edits
+   * (see SaveKind in the contract). Throws only for an unknown session id.
+   */
+  planDavWrite(fileId: string, sessionId: string, lockToken: string | undefined): SavePlan {
+    const session = this.repo.getSession(sessionId);
+    if (!session) throw sessionInvalid('unknown');
+    return this.decideWrite(session, fileId, lockToken, this.clock());
   }
 
   /**
-   * Records an uploaded blob as the file's new version. The lock is checked
-   * again in the same transaction, because it may have changed during the upload.
+   * Records an uploaded blob for a DAV save. The decision is made again in the
+   * same transaction, because the lock or the session may have changed during
+   * the upload: the result can be a current version, a conflict version, or a
+   * quarantine entry, but the bytes are always kept.
    */
   commitDavWrite(input: {
     fileId: string;
+    fileName: string;
     sessionId: string;
-    lockToken: string;
+    lockToken: string | undefined;
     versionId: string;
     blob: StoredBlob;
-  }): { version: VersionRow; revived: boolean } {
+    /** Quarantine regardless of the lock, with this reason (Save As the session may not make). */
+    forceQuarantine?: string;
+  }): DavWriteResult {
     const now = this.clock();
     const result = this.repo.transaction(() => {
-      const session = this.requireSession(input.sessionId, input.fileId);
-      this.requireWriter(session);
-      const { lock, revived } = this.checkLockForWrite(input.fileId, session.id, input.lockToken, now);
-      const version = this.repo.addVersion({
+      const session = this.repo.getSession(input.sessionId);
+      if (!session) throw sessionInvalid('unknown');
+      const plan: SavePlan = input.forceQuarantine
+        ? { kind: 'quarantined', reason: input.forceQuarantine }
+        : this.decideWrite(session, input.fileId, input.lockToken, now);
+      if (plan.kind === 'quarantined') {
+        this.insertQuarantine(session, input.fileId, input.fileName, plan.reason, input.versionId, input.blob, now);
+        return { kind: plan.kind, reason: plan.reason, session };
+      }
+      const row = {
         id: input.versionId,
         fileId: input.fileId,
         blobKey: input.blob.key,
@@ -281,16 +326,32 @@ export class DavPolicy {
         sha256: input.blob.sha256,
         createdBy: session.user_id,
         createdAt: now,
-        source: 'dav',
         davSessionId: session.id,
-      });
-      const expiresAt = now + lock.timeout_s * 1000;
-      this.repo.setLockBaseVersion(input.fileId, version.id);
-      this.repo.extendLock(input.fileId, lock.timeout_s, expiresAt);
+      };
       this.repo.touchSession(session.id, now);
-      return { version, revived, lock, expiresAt };
+      if (plan.kind === 'conflict') {
+        const version = this.repo.addSideVersion({ ...row, source: 'conflict' });
+        return { kind: plan.kind, reason: plan.reason, session, version };
+      }
+      const version = this.repo.addVersion({ ...row, source: 'dav' });
+      const expiresAt = now + plan.lock.timeout_s * 1000;
+      this.repo.setLockBaseVersion(input.fileId, version.id);
+      this.repo.extendLock(input.fileId, plan.lock.timeout_s, expiresAt);
+      return { kind: plan.kind, session, version, revived: plan.revived, lock: plan.lock, expiresAt };
     });
-    if (result.revived) {
+
+    if (result.kind === 'quarantined') {
+      this.events.publish({
+        type: 'upload.quarantined',
+        fileId: input.fileId,
+        userId: result.session.user_id,
+        sessionId: result.session.id,
+        reason: result.reason,
+        at: iso(now),
+      });
+      return { kind: 'quarantined', id: input.versionId, reason: result.reason, revived: false };
+    }
+    if (result.kind === 'current' && result.revived) {
       this.events.publish({
         type: 'lock.revived',
         fileId: input.fileId,
@@ -306,10 +367,78 @@ export class DavPolicy {
       versionId: result.version.id,
       versionNo: result.version.version_no,
       userId: result.version.created_by,
-      source: 'dav',
+      source: result.version.source,
       at: iso(now),
     });
-    return { version: result.version, revived: result.revived };
+    return result.kind === 'current'
+      ? { kind: 'current', version: result.version, revived: result.revived }
+      : { kind: 'conflict', version: result.version, reason: result.reason, revived: false };
+  }
+
+  /**
+   * Stores a save whose token no longer resolves (revoked or beyond its cap)
+   * in quarantine. Unknown tokens are refused: there is no user to attribute
+   * the bytes to, and accepting them would let anyone fill the store.
+   */
+  quarantineByToken(token: string, fileName: string, id: string, blob: StoredBlob): { sessionId: string; reason: string } {
+    const now = this.clock();
+    const session = this.repo.getSessionByTokenHash(hashToken(token));
+    if (!session) throw sessionInvalid('unknown');
+    const reason = session.revoked_at !== null ? 'revoked' : now >= session.max_expires_at ? 'beyond_cap' : 'session_invalid';
+    this.repo.transaction(() => this.insertQuarantine(session, session.file_id, fileName, reason, id, blob, now));
+    this.events.publish({
+      type: 'upload.quarantined',
+      fileId: session.file_id,
+      userId: session.user_id,
+      sessionId: session.id,
+      reason,
+      at: iso(now),
+    });
+    return { sessionId: session.id, reason };
+  }
+
+  /**
+   * Save As: where a PUT to `name` (not the session's file) should go.
+   *   existing     the session already created this name; save to it as usual
+   *   new          create a file with this name in the session's collection
+   *   quarantined  the session may not write, or the name is not an Office file
+   */
+  planSaveAs(sessionId: string, name: string, supported: boolean): SaveAsPlan {
+    const session = this.repo.getSession(sessionId);
+    if (!session) throw sessionInvalid('unknown');
+    const refusal = this.writeRefusal(session, this.clock());
+    if (refusal) return { kind: 'quarantined', reason: refusal };
+    const existing = this.findSessionFile(sessionId, name);
+    if (existing) return { kind: 'existing', fileId: existing };
+    if (!supported) return { kind: 'quarantined', reason: 'unsupported_name' };
+    return { kind: 'new' };
+  }
+
+  /**
+   * Links a file created by Save As to the session, so the session's token
+   * covers it. No lock is taken here: Word sends PUT (no If header), then LOCK
+   * on the new name straight away (observed). A server-held lock made that
+   * LOCK fail with 423, and Word then DELETEd the new file and lost the save.
+   */
+  registerSaveAs(sessionId: string, fileId: string, name: string): void {
+    const now = this.clock();
+    this.repo.transaction(() => {
+      this.requireSession(sessionId);
+      const file = this.repo.getFile(fileId);
+      if (!file?.current_version_id) throw notFound('file');
+      this.repo.addSessionFile(sessionId, fileId, name, now);
+    });
+  }
+
+  /** The id of the file this session created under `name`, if any. Same name rules as the URL space. */
+  findSessionFile(sessionId: string, name: string): string | undefined {
+    const wanted = name.normalize('NFC').toLowerCase();
+    return this.repo.listSessionFiles(sessionId).find((f) => f.name.normalize('NFC').toLowerCase() === wanted)?.file_id;
+  }
+
+  /** Admin view of quarantined saves. */
+  listQuarantine(): QuarantineRow[] {
+    return this.repo.listQuarantine();
   }
 
   /** Web uploads are refused with 409 while anyone holds an active lock. */
@@ -349,6 +478,61 @@ export class DavPolicy {
       throw new PolicyError(412, 'precondition_failed', 'the file changed after the lock expired');
     }
     return { lock, revived: true };
+  }
+
+  /**
+   * The save decision shared by planDavWrite and commitDavWrite.
+   * A missing lock token is accepted when the session itself holds the file's
+   * lock (Office sometimes saves under its lock without sending the If header).
+   */
+  private decideWrite(session: SessionRow, fileId: string, lockToken: string | undefined, now: number): SavePlan {
+    const refusal = this.writeRefusal(session, now);
+    if (refusal) return { kind: 'quarantined', reason: refusal };
+    if (!this.covers(session, fileId)) return { kind: 'quarantined', reason: 'other_file' };
+    const token = lockToken ?? this.repo.getLock(fileId)?.lock_token;
+    if (!token) return { kind: 'conflict', reason: 'no_lock' };
+    try {
+      const { lock, revived } = this.checkLockForWrite(fileId, session.id, token, now);
+      return { kind: 'current', lock, revived };
+    } catch (err) {
+      if (err instanceof PolicyError) return { kind: 'conflict', reason: err.status === 423 ? 'locked_by_other' : 'lock_lost' };
+      throw err;
+    }
+  }
+
+  /** Why this session may not write at all, or null when it may. */
+  private writeRefusal(session: SessionRow, now: number): string | null {
+    if (session.revoked_at !== null) return 'revoked';
+    if (now >= session.max_expires_at) return 'beyond_cap';
+    if (!this.isWriter(session)) return 'forbidden';
+    return null;
+  }
+
+  private covers(session: SessionRow, fileId: string): boolean {
+    return session.file_id === fileId || this.repo.sessionOwnsFile(session.id, fileId);
+  }
+
+  private insertQuarantine(
+    session: SessionRow,
+    fileId: string | null,
+    fileName: string,
+    reason: string,
+    id: string,
+    blob: StoredBlob,
+    now: number,
+  ): void {
+    this.repo.insertQuarantine({
+      id,
+      session_id: session.id,
+      user_id: session.user_id,
+      file_id: fileId && this.repo.getFile(fileId) ? fileId : null,
+      file_name: fileName,
+      reason,
+      blob_key: blob.key,
+      size: blob.size,
+      sha256: blob.sha256,
+      created_at: now,
+    });
   }
 
   private assertLive(session: SessionRow): void {

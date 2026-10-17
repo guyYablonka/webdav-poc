@@ -4,7 +4,7 @@
   "type": "module",
   "description": "POC: edit Office files over WebDAV through a pluggable gateway",
   "engines": {
-    "node": ">=22.12"
+    "node": ">=22.15"
   },
   "workspaces": [
     "packages/gateway-contract",

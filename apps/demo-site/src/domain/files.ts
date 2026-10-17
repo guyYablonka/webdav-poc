@@ -4,7 +4,7 @@ import type { FileInfo, PutContentResponse } from '@office-dav/gateway-contract'
 import type { EventBus } from '../events/bus.js';
 import { BlobTooLargeError, type BlobStore, type StoredBlob } from '../storage/blob-store.js';
 import type { FileRow, Repo, SessionRow, VersionRow, VersionSource } from '../storage/repo.js';
-import type { Clock, DavPolicy } from './dav-policy.js';
+import type { Clock, DavPolicy, DavWriteResult } from './dav-policy.js';
 import { PolicyError, notFound } from './errors.js';
 import { officeTypeFor, type OfficeType } from './office-types.js';
 
@@ -108,7 +108,14 @@ export class FileService {
   }
 
   /** New file from a web upload or the seed. */
-  async createFile(input: { name: string; body: Readable; userId: string; source: 'seed' | 'web' }): Promise<FileRow> {
+  async createFile(input: {
+    name: string;
+    body: Readable;
+    userId: string;
+    source: 'seed' | 'web' | 'dav';
+    /** The DAV session behind a Save As, recorded on the first version. */
+    davSessionId?: string;
+  }): Promise<FileRow> {
     const name = cleanFileName(input.name);
     const type = officeTypeFor(name);
     if (!type) throw new PolicyError(400, 'bad_request', 'only .docx, .xlsx and .pptx files are supported');
@@ -129,7 +136,7 @@ export class FileService {
           createdBy: input.userId,
           createdAt: now,
           source: input.source,
-          davSessionId: null,
+          davSessionId: input.davSessionId ?? null,
         });
       }),
     );
@@ -164,7 +171,12 @@ export class FileService {
     return version;
   }
 
-  /** A save from Office through the gateway's PUT /files/:fileId/content. */
+  /**
+   * A save from Office through the gateway's PUT /files/:fileId/content.
+   * Always stores the bytes (current, conflict or quarantine; see SaveKind),
+   * because Office drops the edits on any refusal without telling the user.
+   * Only an unknown session or an oversized body is refused.
+   */
   async saveFromDav(input: {
     fileId: string;
     sessionId: string;
@@ -172,23 +184,100 @@ export class FileService {
     contentLength: number | undefined;
     body: Readable;
   }): Promise<PutContentResponse> {
-    this.requireFile(input.fileId);
-    // Refuse before reading the body when the outcome is already known.
-    this.policy.checkDavWrite(input.fileId, input.sessionId, input.lockToken);
+    const file = this.requireFile(input.fileId);
+    this.policy.planDavWrite(input.fileId, input.sessionId, input.lockToken); // throws for an unknown session only
     if (input.contentLength !== undefined && input.contentLength > this.opts.maxUploadBytes) throw payloadTooLarge();
 
     const versionId = randomUUID();
     const blob = await this.store(input.fileId, versionId, input.body);
-    const { version, revived } = this.withCleanup(blob, () =>
+    const result = this.withCleanup(blob, () =>
       this.policy.commitDavWrite({
         fileId: input.fileId,
+        fileName: file.name,
         sessionId: input.sessionId,
-        lockToken: input.lockToken!,
+        lockToken: input.lockToken,
         versionId,
         blob,
       }),
     );
-    return { versionId: version.id, size: version.size, updatedAt: iso(version.created_at), revived };
+    return this.putResponse(input.fileId, result, blob, false);
+  }
+
+  /**
+   * Save As from Office: a PUT to a new name in the session's collection.
+   * Creates a file owned by the session's user (or saves to the one this
+   * session already created with that name), so Word keeps saving there.
+   */
+  async saveAsFromDav(input: {
+    sessionId: string;
+    name: string;
+    contentLength: number | undefined;
+    body: Readable;
+  }): Promise<PutContentResponse> {
+    if (input.contentLength !== undefined && input.contentLength > this.opts.maxUploadBytes) throw payloadTooLarge();
+    let name: string | null = null;
+    try {
+      name = cleanFileName(input.name);
+    } catch {
+      // An unusable name is quarantined below rather than refused.
+    }
+    const type = name ? officeTypeFor(name) : null;
+    const plan = this.policy.planSaveAs(input.sessionId, name ?? input.name, type !== null);
+    if (plan.kind === 'existing') {
+      return this.saveFromDav({ fileId: plan.fileId, sessionId: input.sessionId, lockToken: undefined, contentLength: input.contentLength, body: input.body });
+    }
+    const session = this.policy.requireSessionRow(input.sessionId);
+    if (plan.kind === 'quarantined' || !name || !type) {
+      const id = randomUUID();
+      const blob = await this.store(`quarantine/${session.id}`, id, input.body);
+      const result = this.withCleanup(blob, () =>
+        this.policy.commitDavWrite({
+          fileId: session.file_id,
+          fileName: input.name,
+          sessionId: session.id,
+          lockToken: undefined,
+          versionId: id,
+          blob,
+          forceQuarantine: plan.kind === 'quarantined' ? plan.reason : 'unsupported_name',
+        }),
+      );
+      return this.putResponse(session.file_id, result, blob, false);
+    }
+    const file = await this.createFile({ name, body: input.body, userId: session.user_id, source: 'dav', davSessionId: session.id });
+    this.policy.registerSaveAs(session.id, file.id, name);
+    const version = this.repo.getVersion(file.current_version_id!)!;
+    return {
+      versionId: version.id,
+      kind: 'current',
+      fileId: file.id,
+      size: version.size,
+      updatedAt: iso(version.created_at),
+      revived: false,
+      created: true,
+    };
+  }
+
+  /** Last resort for a save whose token no longer resolves: keep the bytes for an admin. */
+  async quarantineFromDav(input: { token: string; fileName: string; body: Readable }): Promise<{ quarantineId: string }> {
+    const id = randomUUID();
+    const blob = await this.store('quarantine/by-token', id, input.body);
+    this.withCleanup(blob, () => this.policy.quarantineByToken(input.token, input.fileName, id, blob));
+    return { quarantineId: id };
+  }
+
+  private putResponse(fileId: string, result: DavWriteResult, blob: StoredBlob, created: boolean): PutContentResponse {
+    if (result.kind === 'quarantined') {
+      return { versionId: result.id, kind: 'quarantined', fileId, size: blob.size, updatedAt: iso(this.clock()), revived: false, created };
+    }
+    return {
+      versionId: result.version.id,
+      kind: result.kind,
+      fileId,
+      size: result.version.size,
+      updatedAt: iso(result.version.created_at),
+      revived: result.revived,
+      created,
+    };
   }
 
   listSummaries(): FileSummary[] {

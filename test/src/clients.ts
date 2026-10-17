@@ -120,6 +120,11 @@ export function demoClient(stack: Stack) {
     async forceUnlock(cookie: string, id: string): Promise<number> {
       return (await call('POST', `/api/files/${id}/force-unlock`, cookie)).status;
     },
+
+    /** Saves kept aside because their session could not write (admin view). */
+    async quarantine(cookie: string): Promise<Array<{ sessionId: string; fileId: string | null; fileName: string; reason: string; size: number }>> {
+      return (await call<Array<{ sessionId: string; fileId: string | null; fileName: string; reason: string; size: number }>>('GET', '/api/admin/quarantine', cookie)).json;
+    },
   };
 }
 

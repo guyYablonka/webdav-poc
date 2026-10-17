@@ -250,18 +250,64 @@ describe('LOCK, PUT and UNLOCK', () => {
     expect(res.body).toMatch(/<D:timeout>Second-\d+<\/D:timeout>/);
   });
 
-  it('refuses a PUT without a lock token before calling the gateway', async () => {
-    const { path } = setup();
-    const res = await app.inject({ method: 'PUT', url: path, payload: 'x' });
-    expect(res.statusCode).toBe(423);
-    expect(gateway.calls.map((c) => c.op)).not.toContain('putContent');
+  // Word reports any refused save as successful and drops the edits (verified on
+  // Word 16.0.19127 for 401, 403, 412 and 423), so saves are never refused.
+  it('passes a PUT without a lock token to the gateway, which keeps it as a conflict', async () => {
+    const { path, file } = setup();
+    const res = await app.inject({ method: 'PUT', url: path, payload: 'no-lock' });
+    expect(res.statusCode).toBe(204);
+    expect(gateway.conflicts).toEqual([{ fileId: file.fileId, content: Buffer.from('no-lock') }]);
   });
 
-  it('maps a gateway 412 on PUT', async () => {
-    const { path } = setup();
+  it('answers 204 for a save under a stale lock token and keeps the bytes as a conflict', async () => {
+    const { path, file } = setup();
     await lock(path);
-    const res = await app.inject({ method: 'PUT', url: path, headers: { if: '(<opaquelocktoken:stale>)' }, payload: 'x' });
-    expect(res.statusCode).toBe(412);
+    const res = await app.inject({ method: 'PUT', url: path, headers: { if: '(<opaquelocktoken:stale>)' }, payload: 'stale' });
+    expect(res.statusCode).toBe(204);
+    expect(gateway.conflicts.map((c) => c.content.toString())).toEqual(['stale']);
+    expect(gateway.files.get(file.fileId)!.content.toString()).toBe('original');
+  });
+
+  it('Save As: a PUT to a new name creates the file, and later requests to that name reach it', async () => {
+    const { collection, session } = setup();
+    const copy = `${collection}${encodeURIComponent('Copy of Plan.docx')}`;
+    expect((await app.inject({ method: 'HEAD', url: copy })).statusCode).toBe(404);
+
+    const created = await app.inject({ method: 'PUT', url: copy, payload: 'v1 of copy' });
+    expect(created.statusCode).toBe(201);
+    const fileId = gateway.sessionFiles.get(session.sessionId)!.get('copy of plan.docx')!;
+    expect(gateway.files.get(fileId)!.content.toString()).toBe('v1 of copy');
+
+    // Observed: Word LOCKs the new name right after the PUT; that must succeed, or Word
+    // DELETEs the copy and the Save As is lost. Its next Ctrl+S saves under that lock.
+    const copyLock = await lock(copy);
+    expect((await app.inject({ method: 'PUT', url: copy, headers: { if: `(<${copyLock}>)` }, payload: 'v2 of copy' })).statusCode).toBe(204);
+    expect(gateway.files.get(fileId)!.content.toString()).toBe('v2 of copy');
+
+    const head = await app.inject({ method: 'HEAD', url: copy });
+    expect(head.statusCode).toBe(200);
+    const propfind = await app.inject({ method: 'PROPFIND', url: copy, headers: { depth: '0' } });
+    expect(propfind.statusCode).toBe(207);
+    // The new file is addressed inside the original collection, as Office saw it.
+    expect(propfind.body).toContain(`${collection}Copy%20of%20Plan.docx`);
+  });
+
+  it('quarantines a save whose session was revoked, and answers 204', async () => {
+    const { path, token } = setup();
+    await lock(path);
+    gateway.revoke(token);
+    const res = await app.inject({ method: 'PUT', url: path, headers: { if: '(<opaquelocktoken:x>)' }, payload: 'late edits' });
+    expect(res.statusCode).toBe(204);
+    expect(gateway.quarantined.map((q) => [q.name, q.content.toString()])).toEqual([['Plan.docx', 'late edits']]);
+    // The lock went with the session, so UNLOCK is a no-op success rather than a 401.
+    expect((await app.inject({ method: 'UNLOCK', url: path, headers: { 'lock-token': '<opaquelocktoken:x>' } })).statusCode).toBe(204);
+  });
+
+  it('still answers 401 for a PUT with an unknown token', async () => {
+    const { file } = setup();
+    const res = await app.inject({ method: 'PUT', url: `/s/not-a-token/${file.fileId}/Plan.docx`, payload: 'x' });
+    expect(res.statusCode).toBe(401);
+    expect(gateway.quarantined).toEqual([]);
   });
 
   it('refuses shared locks with 412', async () => {

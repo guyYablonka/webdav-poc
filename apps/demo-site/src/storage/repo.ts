@@ -17,7 +17,20 @@ export interface FileRow {
   updated_by: string | null;
 }
 
-export type VersionSource = 'seed' | 'web' | 'dav';
+export type VersionSource = 'seed' | 'web' | 'dav' | 'conflict';
+
+export interface QuarantineRow {
+  id: string;
+  session_id: string;
+  user_id: string;
+  file_id: string | null;
+  file_name: string;
+  reason: string;
+  blob_key: string;
+  size: number;
+  sha256: string;
+  created_at: number;
+}
 
 export interface VersionRow {
   id: string;
@@ -120,6 +133,20 @@ export class Repo {
 
   /** Inserts the next version and makes it the file's current version. */
   addVersion(v: NewVersion): VersionRow {
+    this.insertVersionRow(v);
+    this.db
+      .prepare('UPDATE files SET current_version_id = ?, size = ?, updated_at = ?, updated_by = ? WHERE id = ?')
+      .run(v.id, v.size, v.createdAt, v.createdBy, v.fileId);
+    return this.getVersion(v.id)!;
+  }
+
+  /** Inserts a version that does not become current (a conflict save). */
+  addSideVersion(v: NewVersion): VersionRow {
+    this.insertVersionRow(v);
+    return this.getVersion(v.id)!;
+  }
+
+  private insertVersionRow(v: NewVersion): void {
     const next = this.db
       .prepare('SELECT COALESCE(MAX(version_no), 0) + 1 AS n FROM file_versions WHERE file_id = ?')
       .get(v.fileId) as { n: number };
@@ -129,10 +156,6 @@ export class Repo {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(v.id, v.fileId, next.n, v.blobKey, v.size, v.sha256, v.createdBy, v.createdAt, v.source, v.davSessionId);
-    this.db
-      .prepare('UPDATE files SET current_version_id = ?, size = ?, updated_at = ?, updated_by = ? WHERE id = ?')
-      .run(v.id, v.size, v.createdAt, v.createdBy, v.fileId);
-    return this.getVersion(v.id)!;
   }
 
   getVersion(id: string): VersionRow | undefined {
@@ -198,8 +221,45 @@ export class Repo {
     return this.db.prepare('SELECT * FROM file_locks WHERE lock_token = ?').get(lockToken) as LockRow | undefined;
   }
 
-  getLockBySession(sessionId: string): LockRow | undefined {
-    return this.db.prepare('SELECT * FROM file_locks WHERE session_id = ?').get(sessionId) as LockRow | undefined;
+  /** A session can hold several locks: its file and any files it created with Save As. */
+  listLocksBySession(sessionId: string): LockRow[] {
+    return this.db.prepare('SELECT * FROM file_locks WHERE session_id = ?').all(sessionId) as LockRow[];
+  }
+
+  // session files (Save As) ------------------------------------------------
+
+  addSessionFile(sessionId: string, fileId: string, name: string, now: number): void {
+    this.db
+      .prepare('INSERT INTO dav_session_files (session_id, file_id, name, created_at) VALUES (?, ?, ?, ?)')
+      .run(sessionId, fileId, name, now);
+  }
+
+  sessionOwnsFile(sessionId: string, fileId: string): boolean {
+    return (
+      this.db.prepare('SELECT 1 FROM dav_session_files WHERE session_id = ? AND file_id = ?').get(sessionId, fileId) !==
+      undefined
+    );
+  }
+
+  listSessionFiles(sessionId: string): Array<{ file_id: string; name: string }> {
+    return this.db
+      .prepare('SELECT file_id, name FROM dav_session_files WHERE session_id = ? ORDER BY created_at')
+      .all(sessionId) as Array<{ file_id: string; name: string }>;
+  }
+
+  // quarantine -------------------------------------------------------------
+
+  insertQuarantine(q: QuarantineRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO dav_quarantine (id, session_id, user_id, file_id, file_name, reason, blob_key, size, sha256, created_at)
+         VALUES (@id, @session_id, @user_id, @file_id, @file_name, @reason, @blob_key, @size, @sha256, @created_at)`,
+      )
+      .run(q);
+  }
+
+  listQuarantine(): QuarantineRow[] {
+    return this.db.prepare('SELECT * FROM dav_quarantine ORDER BY created_at DESC').all() as QuarantineRow[];
   }
 
   insertLock(lock: LockRow): void {

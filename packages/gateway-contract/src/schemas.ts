@@ -21,6 +21,10 @@ export const GatewayHeaders = {
   lockToken: 'x-lock-token',
   /** The version id of a content stream (same value as the unquoted ETag). */
   versionId: 'x-version-id',
+  /** The raw session token, only on PUT /quarantine (the session no longer resolves). */
+  davToken: 'x-dav-token',
+  /** The file name Office saved to, only on PUT /quarantine. URI-encoded. */
+  davFileName: 'x-dav-file-name',
 } as const;
 
 /** Endpoint paths, relative to GATEWAY_BASE_PATH. */
@@ -30,6 +34,14 @@ export const GatewayPaths = {
   content: (fileId: string) => `/files/${encodeURIComponent(fileId)}/content`,
   locks: '/locks',
   lock: (lockToken: string) => `/locks/${encodeURIComponent(lockToken)}`,
+  /** A file this session created with Save As, looked up by name. */
+  sessionFile: (sessionId: string, name: string) =>
+    `/sessions/${encodeURIComponent(sessionId)}/files/${encodeURIComponent(name)}`,
+  /** Save As: create a file with this name (or save to the one this session already created). */
+  sessionFileContent: (sessionId: string, name: string) =>
+    `/sessions/${encodeURIComponent(sessionId)}/files/${encodeURIComponent(name)}/content`,
+  /** Last resort for a save whose session no longer authenticates. */
+  quarantine: '/quarantine',
 } as const;
 
 const Id = z.string().min(1).max(200);
@@ -104,12 +116,35 @@ export type FileInfo = z.infer<typeof FileInfo>;
 // PUT /files/:fileId/content
 // ---------------------------------------------------------------------------
 
+/**
+ * Where a save from Office ended up. Office reports every save as successful
+ * whatever status it gets back, and drops the edits on a refusal (verified with
+ * Word 16.0.19127 for 401, 403, 412 and 423), so the gateway never refuses a
+ * save from a known token. It always stores the bytes:
+ *
+ *   current      the file's new current version (the normal case)
+ *   conflict     a side version that did not become current, because the caller
+ *                no longer held the lock (force unlock, expired and overtaken,
+ *                another session's lock). Shown to users to merge or restore.
+ *   quarantined  the session may no longer write (revoked, beyond its cap,
+ *                permission removed, unsupported Save As name). Kept for an
+ *                admin and never shown as a version.
+ */
+export const SaveKind = z.enum(['current', 'conflict', 'quarantined']);
+export type SaveKind = z.infer<typeof SaveKind>;
+
 export const PutContentResponse = z.object({
+  /** The new version id, or the quarantine id when `kind` is `quarantined`. */
   versionId: Id,
+  kind: SaveKind,
+  /** The file the bytes belong to (the new file after Save As). */
+  fileId: Id,
   size: z.number().int().nonnegative(),
   updatedAt: IsoDateTime,
   /** True when the PUT revived a lapsed lock (see the lock policy). */
   revived: z.boolean(),
+  /** True when this PUT created the file (Save As to a new name). */
+  created: z.boolean(),
 });
 export type PutContentResponse = z.infer<typeof PutContentResponse>;
 

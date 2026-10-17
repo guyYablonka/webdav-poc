@@ -1,4 +1,4 @@
-import { Transform, finished, type TransformCallback } from 'node:stream';
+import { Transform, finished, type Readable, type TransformCallback } from 'node:stream';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import {
   davCollectionUrl,
@@ -6,6 +6,7 @@ import {
   encodePathSegment,
   type FileInfo,
   type Intent,
+  type PutContentResponse,
   type ResolveResponse,
 } from '@office-dav/gateway-contract';
 import type { DavConfig } from '../config.js';
@@ -141,9 +142,10 @@ export function createDavHandler(deps: DavHandlerDeps) {
     return { href, isCollection: true, displayName, createdAt: startedAt, modifiedAt: startedAt };
   }
 
-  function fileResource(token: string, file: FileInfo): DavResource {
+  /** `collectionId` is the session's file: Save As files live in its collection, not their own. */
+  function fileResource(token: string, file: FileInfo, collectionId: string = file.fileId): DavResource {
     return {
-      href: davFileUrl(base, token, file.fileId, file.name),
+      href: davFileUrl(base, token, collectionId, file.name),
       isCollection: false,
       displayName: file.name,
       createdAt: new Date(file.createdAt),
@@ -287,24 +289,23 @@ export function createDavHandler(deps: DavHandlerDeps) {
     return sendEmpty(reply, 204);
   }
 
-  async function handlePut(req: FastifyRequest, reply: FastifyReply, file: FileInfo, ctx: CallContext) {
-    const lockToken = parseIfHeader(req.headers.if as string | undefined)[0];
-    if (!lockToken) throw new DavError(423, 'PUT requires a lock token', davError('lock-token-submitted'));
-
-    const ifMatch = req.headers['if-match'];
-    if (ifMatch && !etagMatches(ifMatch, `"${file.versionId}"`)) {
-      throw new DavError(412, 'If-Match does not match the current version');
-    }
-
+  /**
+   * Streams a PUT body to one of the gateway's save endpoints without
+   * buffering, enforcing MAX_UPLOAD_MB. Shared by normal saves, Save As and
+   * quarantine so all three get the same limits and abort handling.
+   */
+  async function streamUpload<T>(
+    req: FastifyRequest,
+    send: (body: Readable, contentLength: number | undefined) => Promise<T>,
+  ): Promise<T> {
     const lengthHeader = req.headers['content-length'];
     const contentLength = lengthHeader === undefined ? undefined : Number(lengthHeader);
     if (contentLength !== undefined && contentLength > config.maxUploadBytes) {
       throw new DavError(413, 'upload exceeds MAX_UPLOAD_MB', undefined, true);
     }
 
-    // Stream without buffering. `pipe` (not `pipeline`) keeps the client socket
-    // alive if the gateway answers early and drops the body, so we can still
-    // send the gateway's status back to Office.
+    // `pipe` (not `pipeline`) keeps the client socket alive if the gateway
+    // answers early and drops the body, so we can still reply to Office.
     const upload = new UploadLimit(config.maxUploadBytes);
     req.raw.pipe(upload);
     finished(req.raw, (err) => {
@@ -312,9 +313,7 @@ export function createDavHandler(deps: DavHandlerDeps) {
     });
 
     try {
-      const saved = await gateway.putContent(file.fileId, upload, { lockToken, contentLength }, ctx);
-      if (saved.revived) req.log.info({ fileId: file.fileId }, 'lock revived by PUT');
-      return reply.code(204).header('etag', `"${saved.versionId}"`).header('content-length', '0').send();
+      return await send(upload, contentLength);
     } catch (err) {
       if (upload.exceeded) throw new DavError(413, 'upload exceeds MAX_UPLOAD_MB', undefined, true);
       throw err;
@@ -327,6 +326,34 @@ export function createDavHandler(deps: DavHandlerDeps) {
     }
   }
 
+  /** Office's view of any stored save: always success, because a refusal makes Word drop the edits silently. */
+  function sendSaved(req: FastifyRequest, reply: FastifyReply, saved: PutContentResponse): FastifyReply {
+    if (saved.revived) req.log.info({ fileId: saved.fileId }, 'lock revived by PUT');
+    if (saved.kind !== 'current') req.log.warn({ fileId: saved.fileId, kind: saved.kind }, 'save stored aside, not as the current version');
+    return reply
+      .code(saved.created ? 201 : 204)
+      .header('etag', `"${saved.versionId}"`)
+      .header('content-length', '0')
+      .send();
+  }
+
+  async function handlePut(req: FastifyRequest, reply: FastifyReply, file: FileInfo, ctx: CallContext) {
+    // No If header is no longer refused: the gateway accepts it when this session
+    // holds the lock (Save As files) and stores a conflict version otherwise.
+    const lockToken = parseIfHeader(req.headers.if as string | undefined)[0];
+
+    const ifMatch = req.headers['if-match'];
+    if (ifMatch && !etagMatches(ifMatch, `"${file.versionId}"`)) {
+      // Office never sent If-Match in the traces; a client that does gets a real precondition failure.
+      throw new DavError(412, 'If-Match does not match the current version');
+    }
+
+    const saved = await streamUpload(req, (body, contentLength) =>
+      gateway.putContent(file.fileId, body, { lockToken, contentLength }, ctx),
+    );
+    return sendSaved(req, reply, saved);
+  }
+
   async function handleFile(
     req: FastifyRequest,
     reply: FastifyReply,
@@ -334,13 +361,28 @@ export function createDavHandler(deps: DavHandlerDeps) {
     session: ResolveResponse,
     ctx: CallContext,
   ) {
-    const file = await gateway.getFile(session.fileId, ctx);
+    let file = await gateway.getFile(session.fileId, ctx);
     if (!sameFileName(file.name, target.fileName)) {
-      // Only the session's file exists here; creating files is out of scope.
-      if (req.method === 'PUT' || req.method === 'LOCK') throw new DavError(403, 'cannot create new resources');
-      throw new DavError(404, 'no such file in this collection');
+      // Another name in the session's collection: a file this session created
+      // with Save As, or a Save As happening now. Refusing the PUT made Word
+      // report success, re-point the document at the new URL and then lose
+      // every later save (verified), so a PUT to a new name creates the file.
+      const sibling = await gateway.findSessionFile(session.sessionId, target.fileName, ctx);
+      if (!sibling) {
+        if (req.method === 'PUT') {
+          if (!session.canWrite) throw new DavError(403, 'session is read-only');
+          const saved = await streamUpload(req, (body, contentLength) =>
+            gateway.saveAs(session.sessionId, target.fileName, body, { contentLength }, ctx),
+          );
+          req.log.info({ fileId: saved.fileId, created: saved.created, kind: saved.kind }, 'save as');
+          return sendSaved(req, reply, saved);
+        }
+        if (req.method === 'LOCK') throw new DavError(403, 'cannot lock a resource that does not exist');
+        throw new DavError(404, 'no such file in this collection');
+      }
+      file = sibling;
     }
-    const resource = fileResource(target.token, file);
+    const resource = fileResource(target.token, file, session.fileId);
 
     switch (req.method) {
       case 'OPTIONS':
@@ -402,8 +444,22 @@ export function createDavHandler(deps: DavHandlerDeps) {
       if (target.kind === 'collection') return await handleCollection(req, reply, target.token, session, ctx);
       return await handleFile(req, reply, target, session, ctx);
     } catch (err) {
+      if (!(err instanceof GatewayError) || err.status !== 401 || err.body?.error === 'gateway_auth') throw err;
       // Any 401 means the session is gone; drop it so the next request asks again.
-      if (err instanceof GatewayError && err.status === 401) resolver.invalidate(target.token);
+      resolver.invalidate(target.token);
+      if (req.method === 'PUT' && target.kind === 'file' && !req.raw.readableEnded) {
+        // Revoked or past its cap while Office still had unsaved edits. A 401
+        // here makes Word report "saved" and drop them (verified), so the body
+        // goes to quarantine for an admin and Office gets success. Unknown
+        // tokens are still refused by the gateway (401).
+        await streamUpload(req, (body, contentLength) =>
+          gateway.quarantine(target.token, target.fileName, body, { contentLength }, ctx),
+        );
+        req.log.warn('save from an invalid session quarantined');
+        return sendEmpty(reply, 204);
+      }
+      // The lock went with the session; there is nothing left to unlock.
+      if (req.method === 'UNLOCK') return sendEmpty(reply, 204);
       throw err;
     }
   };
