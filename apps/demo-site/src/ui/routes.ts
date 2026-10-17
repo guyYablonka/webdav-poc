@@ -23,6 +23,7 @@ const STATIC_DIR = join(dirname(fileURLToPath(import.meta.url)), 'static');
 const STATIC_FILES: Record<string, { type: string; body: Buffer }> = {
   'app.js': { type: 'text/javascript; charset=utf-8', body: readFileSync(join(STATIC_DIR, 'app.js')) },
   'style.css': { type: 'text/css; charset=utf-8', body: readFileSync(join(STATIC_DIR, 'style.css')) },
+  'favicon.svg': { type: 'image/svg+xml', body: readFileSync(join(STATIC_DIR, 'favicon.svg')) },
 };
 
 declare module 'fastify' {

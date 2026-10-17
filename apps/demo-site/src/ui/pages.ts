@@ -7,6 +7,14 @@ function time(iso: string, fmt: 'time' | 'datetime' = 'datetime'): SafeHtml {
   return html`<time datetime="${iso}" data-fmt="${fmt}">${iso}</time>`;
 }
 
+/**
+ * File names stay left-to-right so the extension stays at the end, as in
+ * Windows Explorer; a Hebrew name still reads right-to-left inside the isolate.
+ */
+function fileName(name: string): SafeHtml {
+  return html`<bdi dir="ltr">${name}</bdi>`;
+}
+
 function fileIcon(f: FileSummary): SafeHtml {
   const ext = f.type?.extension ?? 'file';
   const letter = ext === 'docx' ? 'W' : ext === 'xlsx' ? 'X' : ext === 'pptx' ? 'P' : '?';
@@ -40,6 +48,7 @@ export function layout(opts: {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${opts.title} · Office DAV demo</title>
   <link rel="stylesheet" href="/static/style.css">
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
 </head>
 <body data-page="${opts.page}" data-file-id="${opts.fileId ?? ''}">
   <header class="top">
@@ -79,7 +88,7 @@ export function fileRows(files: FileSummary[]): SafeHtml {
   if (files.length === 0) return html`<tr><td colspan="5" class="muted">No files yet. Upload one.</td></tr>`;
   return html`${files.map(
     (f) => html`<tr data-file-id="${f.id}">
-      <td><a class="file-name" href="/files/${f.id}">${fileIcon(f)}<span dir="auto">${f.name}</span></a></td>
+      <td><a class="file-name" href="/files/${f.id}">${fileIcon(f)}${fileName(f.name)}</a></td>
       <td>${lockBadge(f)}</td>
       <td class="num">${f.versionCount}</td>
       <td>${time(f.updatedAt)}${f.updatedBy ? html` <span class="muted">by ${f.updatedBy.displayName}</span>` : ''}</td>
@@ -114,7 +123,7 @@ export function fileDetails(d: FileDetail): SafeHtml {
   return html`<section class="card">
     <div class="card-head">
       <div>
-        <h1 class="file-title">${fileIcon(d)}<span dir="auto">${d.name}</span></h1>
+        <h1 class="file-title">${fileIcon(d)}${fileName(d.name)}</h1>
         <p class="meta">
           ${lockBadge(d)} · v${d.currentVersionNo} · ${formatBytes(d.size)} · saved ${time(d.updatedAt)}
           ${d.updatedBy ? html`by ${d.updatedBy.displayName}` : ''}

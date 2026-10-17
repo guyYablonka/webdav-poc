@@ -54,16 +54,14 @@
   }
 
   // Refreshes are coalesced so a burst of events (LOCK + PUT + UNLOCK) costs one round trip.
-  let pendingDetails = false;
   let pendingPreview = false;
   let scheduled = null;
   function scheduleRefresh({ preview = false } = {}) {
-    pendingDetails = true;
     pendingPreview ||= preview;
     if (scheduled) return;
     scheduled = setTimeout(async () => {
       const withPreview = pendingPreview;
-      pendingDetails = pendingPreview = false;
+      pendingPreview = false;
       scheduled = null;
       if (page === 'list') await swap('file-rows', '/partials/files');
       if (page === 'file') {
