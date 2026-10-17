@@ -1,0 +1,33 @@
+{
+  "name": "@office-dav/demo-site",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "POC stand-in for the real web app: mock login, UI, SSE, and the /gw/v1 gateway.",
+  "main": "src/main.ts",
+  "scripts": {
+    "dev": "tsx watch --clear-screen=false --env-file-if-exists=../../.env src/main.ts",
+    "start": "tsx --env-file-if-exists=../../.env src/main.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.1.3",
+    "@fastify/formbody": "^9.0.1",
+    "@fastify/multipart": "^10.1.4",
+    "@office-dav/gateway-contract": "*",
+    "better-sqlite3": "^13.0.3",
+    "docx": "^9.12.0",
+    "exceljs": "^4.4.0",
+    "fastify": "^5.12.7",
+    "jszip": "^3.10.2",
+    "mammoth": "^1.13.0",
+    "pino": "^10.4.0",
+    "pptxgenjs": "^4.0.1",
+    "xlsx": "^0.18.5",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0"
+  }
+}

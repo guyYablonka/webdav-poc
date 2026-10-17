@@ -1,0 +1,17 @@
+{
+  "name": "@office-dav/integration-tests",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Starts demo-site and dav-service and replays Office's WebDAV request sequence.",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@office-dav/gateway-contract": "*",
+    "@xmldom/xmldom": "^0.9.12",
+    "selfsigned": "^5.5.0",
+    "undici": "^8.12.2"
+  }
+}

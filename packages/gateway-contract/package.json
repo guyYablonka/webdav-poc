@@ -1,0 +1,20 @@
+{
+  "name": "@office-dav/gateway-contract",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Types and zod schemas for the /gw/v1 Gateway API, shared by dav-service and every gateway implementation.",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
+  }
+}
