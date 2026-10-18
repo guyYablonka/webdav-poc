@@ -53,7 +53,7 @@ is the contract.
 
 ## Quick start
 
-Prerequisites: Node 22.12 or newer, [mkcert](https://github.com/FiloSottile/mkcert),
+Prerequisites: Node 22.15 or newer (undici needs zstd support), [mkcert](https://github.com/FiloSottile/mkcert),
 and for the real thing, Windows with Office desktop (Microsoft 365 or 2016+).
 
 ```sh
@@ -132,9 +132,10 @@ open Word. Allow it, and optionally tick "always allow" for localhost.
 | `/`, `/s/`, `/s/:token/` | Minimal collections for Office's parent-path probes (OPTIONS, PROPFIND Depth 0). |
 | `…/_vti_bin/…`, `…/_vti_inf.html` | Fast 404 without calling the gateway (SharePoint/FrontPage probes). |
 
-A `:fileId` other than the session's file is a 404. Any other name in the file's
-collection (for example `~$Plan.docx`) is also a 404, or a 403 for PUT and LOCK,
-because creating files is out of scope. Names are compared after Unicode NFC
+A `:fileId` other than the session's file is a 404. Another name in the file's
+collection is a file this session created with Save As, if there is one.
+Otherwise it is a 404 (for example `~$Plan.docx`), a 403 for LOCK, and for PUT
+it creates the file (Save As, below). Names are compared after Unicode NFC
 normalisation and case folding. `href`s percent-encode UTF-8, with only RFC 3986
 unreserved characters left literal.
 
@@ -147,8 +148,8 @@ unreserved characters left literal.
 | PROPPATCH | `207` with success for every property; nothing is stored. |
 | GET / HEAD | Streams from the gateway. `ETag: "<versionId>"`, `Last-Modified`, exact `Content-Type`, `Content-Length`. Honours `If-None-Match` and `If-Modified-Since`. |
 | LOCK | New exclusive write lock: `200`, `lockdiscovery` body, `Lock-Token` header, `owner` echoed. Refresh: `If` header and no body. `Timeout: Second-N` capped at `LOCK_MAX_TIMEOUT_S`. Shared locks: `412`. |
-| UNLOCK | Requires `Lock-Token`. `204`. |
-| PUT | Requires a lock token from `If`, in either `(<token>)` or `<url> (<token>)` form. The body streams to the gateway without buffering. `204` with the new `ETag`. |
+| UNLOCK | Requires `Lock-Token`. `204`, also after the session was revoked (its lock is already gone). |
+| PUT | Lock token from `If`, in either `(<token>)` or `<url> (<token>)` form; without one, the session's own lock is used if it holds it. The body streams to the gateway without buffering. **Never refused for a known token**: `204` with the new `ETag` whether the bytes became the current version, a conflict version or a quarantine entry (see the policy). `201` when it created a file (Save As). An unknown token is `401`; a read-only session is `403`. |
 | MOVE, COPY, DELETE, MKCOL | `403`. |
 
 ### Session and lock policy (gateway side)
@@ -165,14 +166,34 @@ check-then-write inside one transaction:
   lock's `expires_at`.
 - **Acquire** succeeds if there is no lock row or the row has expired; otherwise
   `423` with `heldBy`. It records `base_version_id` = the current version.
+  Exception, **same-user takeover**: if the active lock belongs to another session
+  of the *same user* (Office crashed, the user clicked Edit again), the new session
+  takes the lock over (`lock.acquired` with `tookOverFrom`).
 - **Revival**: a LOCK refresh or PUT under an expired lock succeeds, with
   `revived: true`, when (1) the session is live, (2) the token matches the row,
   (3) no other session holds an active lock (else `423`), and (4)
   `current_version_id == base_version_id` (else `412`).
-- **PUT** needs the caller's lock to be active or revivable. The gateway checks
-  this before reading the body, writes the blob, then in one transaction re-checks
-  the lock, inserts the version, moves `current_version_id`, and sets the lock's
-  `base_version_id` to the new version.
+- **PUT is never refused for a known session.** Real Word (16.0.19127) reports
+  every refused PUT (`401`, `403`, `412`, `423`) to the user as a successful save
+  and drops the edits. So the gateway writes the blob, then in one transaction
+  decides where it goes (`kind` in the response):
+  - `current`: the caller's lock is active or revivable. Inserts the version,
+    moves `current_version_id`, sets the lock's `base_version_id`.
+  - `conflict`: the lock is missing, lost (force unlock, overtaken after expiry)
+    or held by someone else. Stored as a version with `source: 'conflict'` that
+    does not become current; the owner can restore it from the history.
+  - `quarantined`: the session is revoked or beyond its cap (or cannot write the
+    target). Stored in `dav_quarantine`, visible to admins only
+    (`GET /api/admin/quarantine`), not as a version.
+  - A save whose token no longer resolves at all in dav-service goes to
+    `PUT /quarantine` with the token; the gateway accepts it only if the token
+    hash matches a known (revoked or expired) session, else `401`.
+- **Save As** from Office is a PUT to a new name in the session's collection (the
+  observed sequence is `HEAD` 404, `PUT`, `LOCK` on the new name, `UNLOCK` of the
+  original). The gateway creates a file owned by the user and links it to the
+  session (`dav_session_files`), so the same token covers it. It takes no lock:
+  Word LOCKs the new name itself straight after the PUT, and if that LOCK fails,
+  Word DELETEs the new file.
 - **Web upload while locked**: `409`.
 
 ## Configuration
@@ -234,7 +255,10 @@ service credentials (`Authorization: Bearer <GATEWAY_SECRET>` in the POC) and
 | `POST /sessions/resolve` | `{ token, intent: "read" \| "write" \| "lock" }` | `200 { sessionId, userId, displayName, fileId, canWrite, state: "active" \| "expired" }`, or `401 { reason: "unknown" \| "revoked" \| "beyond_cap" }` |
 | `GET /files/:fileId` | | `200 { fileId, name, mime, size, versionId, updatedAt, createdAt, lock: null \| { lockToken, ownerXml, expiresAt, timeoutS, sessionId } }` |
 | `GET /files/:fileId/content` | | `200` stream with `ETag`, `Content-Type`, `Content-Length`, `Last-Modified`, `X-Version-Id` |
-| `PUT /files/:fileId/content` | stream; `X-Dav-Session`, `X-Lock-Token`, `Content-Length` | `201 { versionId, size, updatedAt, revived }`, or `412`, `423` |
+| `PUT /files/:fileId/content` | stream; `X-Dav-Session`, `X-Lock-Token?`, `Content-Length` | `201 { versionId, kind: "current" \| "conflict" \| "quarantined", fileId, size, updatedAt, revived, created }` |
+| `GET /sessions/:sessionId/files/:name` | | `200` FileInfo of the file this session created under `name`, or `404` |
+| `PUT /sessions/:sessionId/files/:name/content` | stream; `X-Dav-Session`, `Content-Length` | `201` as above (`created: true` the first time) |
+| `PUT /quarantine` | stream; `X-Dav-Token`, `X-Dav-File-Name` (URI-encoded) | `201 { quarantineId }`, or `401` for an unknown token |
 | `POST /locks` | `{ fileId, sessionId, timeoutS, ownerXml?, lockToken? }` | `200 { lockToken, expiresAt, timeoutS, revived }`, or `412`, `423 { heldBy: { userId, displayName, since } }` |
 | `DELETE /locks/:lockToken` | `X-Dav-Session` | `204` |
 
@@ -266,9 +290,9 @@ npm run typecheck
 
 - **Unit, demo-site** (`apps/demo-site/test/policy.test.ts`, `gateway.test.ts`):
   the whole of the policy with a fake clock: acquire, conflict, refresh, each
-  revival condition, revoked, beyond the cap, PUT rules (including a lock removed
-  mid-upload and the orphaned blob being deleted), and the `/gw/v1` routes through
-  `inject`.
+  revival condition, revoked, beyond the cap, same-user takeover, PUT outcomes
+  (current, conflict, quarantined, including a lock removed mid-upload), Save As,
+  quarantine by token, and the `/gw/v1` routes through `inject`.
 - **Unit, dav-service** (`services/dav-service/test/`): `If`/`Timeout`/`Depth`
   parsing, URL space, XML parsing and rendering, the error mapping, log
   redaction, every method against an in-memory fake gateway, and the import
@@ -279,13 +303,20 @@ npm run typecheck
   and the file; PROPFIND Depth 0 and Depth 1; LOCK and GET; PUT with
   `If: (<token>)` and check the ETag and the new version (also over SSE); LOCK
   refresh, a second PUT with a tagged `If`, and UNLOCK. Failure paths: a second
-  session's LOCK (`423`), PUT without a lock (`423`), a revoked session (`401`,
-  despite a warm resolve cache), logout, an expired lock revived by PUT
-  (`lock.revived` over SSE), an expired lock overtaken by another session's save
-  (`412`), force unlock (`412`), web upload while locked (`409`), a wrong
+  session's LOCK (`423`), PUT without a lock or with a foreign token (`204`,
+  conflict version), a revoked session (save quarantined, reads `401`, despite a
+  warm resolve cache), an unknown token (`401`), Save As, logout, an expired lock
+  revived by PUT (`lock.revived` over SSE), an expired lock overtaken by another
+  session's save (late save kept as a conflict), force unlock (conflict),
+  same-user takeover after a crash, web upload while locked (`409`), a wrong
   `fileId` (`404`), the Hebrew file name round-tripping through PROPFIND
   `href`s, a 20 MB streamed PUT, and a check that no token reaches either
   service's logs.
+- **Real Office** (`test/office/real-office.ps1`, Windows with desktop Office):
+  drives Word, Excel and PowerPoint through COM against running services and
+  checks the result on the server side, because Office's COM return values say
+  "saved" even when the server refused. Phases `main`, `expiry` (run the
+  services with `LOCK_MAX_TIMEOUT_S=60`) and `big`; `-Visible` to watch.
 
 ## Manual checklist
 
@@ -303,10 +334,12 @@ watch the live updates.
       Bob; the Edit button warns first). Expect Office to report the file as
       locked and offer read-only; dav-service answers Bob's LOCK with `423`.
 - [ ] **Revoke the session mid-edit** (Admin → Revoke session), then save.
-      Expect Office to report that the upload failed, without a password
-      prompt; no version is created.
-- [ ] **Force unlock while Office is open**, then save. Expect the save to fail
-      (`412`); no version is created.
+      Office reports success (it would even for a refusal); the bytes appear
+      in `GET /api/admin/quarantine`, and no version is created.
+- [ ] **Force unlock while Office is open**, then save. A `conflict` version
+      appears in the history; the current version does not change.
+- [ ] **Save As** to a new name in the same folder, edit, save. A new file
+      appears with both saves; the original is unchanged.
 - [ ] **A 100 MB xlsx**: `npm run make-big-xlsx` writes `big-100mb.xlsx`. Upload
       it, open it in Excel, edit a cell, save. (The preview is skipped above
       20 MB.)
@@ -324,23 +357,26 @@ npm run office-trace -- office.log       # one line per request, with the header
 
 ## Observed Office behaviour
 
-**Not captured yet.** This POC was built and tested on Linux without Office. The
-integration tests replay the sequence the brief describes, not a recording. After
-the first run on Windows, record here every place where Office's real traffic
-(from `npm run office-trace`) differs from this document, for example:
+Captured with Microsoft 365 Word, Excel and PowerPoint 16.0.19127 on Windows 11,
+over plain HTTP on localhost, with `test/office/real-office.ps1`:
 
-- the first requests Office sends, and on which paths (root, `/s/`, `/s/<token>/`, the collection);
-- which properties its PROPFIND asks for, and whether it sends PROPPATCH;
-- the `Timeout` it requests and how often it refreshes the lock;
-- whether PUT uses the tagged or untagged `If` form, and whether it sends `If-Match`;
-- how it reacts to `401` (our `WWW-Authenticate: Bearer`), `412` and `423`;
-- how it encodes the Hebrew file name.
-
-The implementation already allows for behaviour that public documentation
-describes but that has not been verified here: SharePoint/FrontPage probes
-(`_vti_bin`, `_vti_inf.html`), PROPFIND on parent collections, PROPFIND for
-Microsoft-namespace properties (answered with a `404` propstat), PROPPATCH of
-Windows timestamps, and both forms of the `If` header.
+- **A refused PUT is reported as a successful save.** For `401`, `403`, `412`
+  and `423` alike, Word's Save returns normally and the document is marked
+  saved, and the edits are gone. This is why PUT is never refused (see the policy).
+- Open: `HEAD`, `LOCK` (asks `Timeout: Second-600`), `GET`, `PROPFIND` Depth 0.
+  Save: `PUT` with the `If` header. Close: `UNLOCK`. No PROPPATCH and no
+  `_vti_*` probes were seen.
+- It does not refresh a lock the server shortened: with a 60 s grant it sent no
+  LOCK refresh during 90 s idle, so revival on PUT is what keeps the save.
+- **Save As (Word)**: `HEAD` on the new name (404), `PUT`, `LOCK` the new name,
+  `UNLOCK` the original. If the LOCK fails, it sends `DELETE` and the document
+  ends up pointing at a file that is not there; later saves are lost silently.
+  Excel raises a COM error in the same situation and keeps the original.
+- **A second user** gets Office's "File In Use" dialog ("locked for editing by
+  another user", no name shown, even for the user's own crashed session).
+  It offers "Edit and merge later"; that path is untested.
+- **Excel, large files**: COM `Save()` returns before the upload ends, and in two
+  runs with a 100 MB workbook Excel quit without sending `UNLOCK`.
 
 ## Porting to production
 
@@ -401,9 +437,15 @@ instances, publish through Redis or Postgres `LISTEN/NOTIFY`.
   the cause is its own credentials, not the user's session.
 - **Extra statuses.** Gateway `400`, `404` and `409` pass through; any other
   unexpected `4xx` becomes `500` (a contract mismatch).
-- **PUT with the wrong token while the file is locked** returns `423` (the
-  caller does not hold the active lock). The same request when no active lock
-  exists returns `412` (condition 2).
+- **PUT never answers 412 or 423, or 401 for a known token.** The brief's
+  refusals lose data with real Office (see
+  [Observed Office behaviour](#observed-office-behaviour)); the bytes are kept
+  as a conflict version or in quarantine instead, and `kind` in the gateway
+  response says which.
+- **Save As creates a file**, which the brief put out of scope, because refusing
+  it made Word lose every later save without telling the user.
+- **Same-user takeover** replaces the brief's "423 until the old lock expires".
+  If the old session is still alive after all, its next save becomes a conflict.
 - **UNLOCK of an unknown token** is `204`: the lock is already gone (it expired
   and was replaced, or was force-unlocked). UNLOCK of another session's lock is `403`.
 - **Revocation releases the lock**, so other users are not blocked by a dead session.
@@ -413,9 +455,7 @@ instances, publish through Redis or Postgres `LISTEN/NOTIFY`.
   collections can still answer.
 - **`/s/`** is answered like `/` and `/s/:token/`, in case Office probes it.
 - **401 responses** carry `WWW-Authenticate: Bearer realm="office-dav"`. Office
-  cannot answer a Bearer challenge, so it should fail the request rather than
-  prompt for a password. This is unverified; see
-  [Observed Office behaviour](#observed-office-behaviour).
+  showed no password prompt for them; it reports the save as done.
 - **Extra SSE events**: `lock.refreshed`, `file.created` and `session.revoked`,
   besides the four required ones.
 - **Lock tokens are bound to their session**, so another session cannot present
@@ -423,9 +463,17 @@ instances, publish through Redis or Postgres `LISTEN/NOTIFY`.
 
 ## Known limitations
 
-- Reopening a file in a new session after Office crashed without UNLOCK gets
-  `423` until the old lock expires (or an admin force-unlocks it), as the acquire
-  rule requires.
+- After Office crashes (or Excel quits without UNLOCK, seen with large files),
+  the same user can reopen at once (takeover), but **another user** is blocked
+  until the lock expires or an admin force-unlocks it.
+- Office still tells the user "saved" for a conflict or a quarantined save.
+  Nothing tells them otherwise yet; the demo site shows it in the activity feed
+  only. A product needs a notification to the owner (email or in-app).
+- Save As in a new session cannot see names other sessions created, so two files
+  with the same name can exist (the demo site's file list is flat). A real drive
+  needs a folder-level rule (for example auto-suffix) and a real-Office check of
+  the href Word then sees.
+- "Edit and merge later" in Office's File In Use dialog is untested.
 - The demo site's preview uses SheetJS `xlsx@0.18.5`, the last version on npm.
   It has published advisories for crafted files. SheetJS distributes fixed
   versions from its own CDN
@@ -438,5 +486,5 @@ instances, publish through Redis or Postgres `LISTEN/NOTIFY`.
   Office's recent-files list. It is useless after revocation or logout, and
   `TOKEN_MAX_AGE_S` bounds its life.
 - Out of scope, as briefed: Mac, mobile, Office for the web, co-authoring,
-  AutoSave, Save As or creating files from Office, MS-OFBA, real OIDC, PostgreSQL
+  AutoSave, creating files from Office other than Save As, MS-OFBA, real OIDC, PostgreSQL
   and S3.

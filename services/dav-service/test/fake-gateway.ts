@@ -6,6 +6,12 @@ import { GatewayError } from '../src/gateway/errors.js';
 
 export const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 
+async function readAll(body: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of body) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks);
+}
+
 /** In-memory GatewayClient with just enough lock behaviour to drive the handlers. */
 export class FakeGateway implements GatewayClient {
   readonly calls: Array<{ op: string; ctx: CallContext; arg?: unknown }> = [];
@@ -82,20 +88,76 @@ export class FakeGateway implements GatewayClient {
     };
   }
 
+  /** Saves stored aside: lock mismatches (conflict) and quarantined bodies. */
+  readonly conflicts: Array<{ fileId: string; content: Buffer }> = [];
+  readonly quarantined: Array<{ token: string; name: string; content: Buffer }> = [];
+  /** Save As files per session id, by lower-cased name. */
+  readonly sessionFiles = new Map<string, Map<string, string>>();
+
   async putContent(fileId: string, body: Readable, opts: PutContentOptions, ctx: CallContext): Promise<PutContentResponse> {
     this.record('putContent', ctx, opts);
     const file = this.file(fileId);
-    if (file.info.lock?.lockToken !== opts.lockToken) {
-      body.resume();
-      throw new GatewayError(412, { error: 'precondition_failed' }, 'lock mismatch');
+    const content = await readAll(body);
+    // dav-service may still hold a cached resolve after a revoke; like the real gateway, the
+    // session check happens here too and the body goes to quarantine instead of a 401.
+    const revokedToken = ctx.sessionId ? this.revokedSessions.get(ctx.sessionId) : undefined;
+    if (revokedToken) {
+      this.quarantined.push({ token: revokedToken, name: file.info.name, content });
+      return { versionId: randomUUID(), kind: 'quarantined', fileId, size: content.length, updatedAt: new Date().toISOString(), revived: false, created: false };
     }
-    const chunks: Buffer[] = [];
-    for await (const chunk of body) chunks.push(chunk as Buffer);
-    file.content = Buffer.concat(chunks);
+    // Mirrors the gateway rule: a save is never refused; without the lock it is a conflict copy.
+    const lockToken = opts.lockToken ?? (file.info.lock?.sessionId === ctx.sessionId ? file.info.lock?.lockToken : undefined);
+    if (!lockToken || file.info.lock?.lockToken !== lockToken) {
+      this.conflicts.push({ fileId, content });
+      return { versionId: randomUUID(), kind: 'conflict', fileId, size: content.length, updatedAt: new Date().toISOString(), revived: false, created: false };
+    }
+    file.content = content;
     file.info.size = file.content.length;
     file.info.versionId = randomUUID();
     file.info.updatedAt = new Date().toISOString();
-    return { versionId: file.info.versionId, size: file.info.size, updatedAt: file.info.updatedAt, revived: false };
+    return { versionId: file.info.versionId, kind: 'current', fileId, size: file.info.size, updatedAt: file.info.updatedAt, revived: false, created: false };
+  }
+
+  async findSessionFile(sessionId: string, name: string, ctx: CallContext): Promise<FileInfo | null> {
+    this.record('findSessionFile', ctx, name);
+    const fileId = this.sessionFiles.get(sessionId)?.get(name.toLowerCase());
+    return fileId ? structuredClone(this.file(fileId).info) : null;
+  }
+
+  async saveAs(sessionId: string, name: string, body: Readable, _opts: { contentLength: number | undefined }, ctx: CallContext): Promise<PutContentResponse> {
+    this.record('saveAs', ctx, name);
+    // Unlocked, like the gateway: Office LOCKs the new name itself right after this PUT.
+    const info = this.addFile(name, await readAll(body));
+    const byName = this.sessionFiles.get(sessionId) ?? new Map<string, string>();
+    byName.set(name.toLowerCase(), info.fileId);
+    this.sessionFiles.set(sessionId, byName);
+    return { versionId: info.versionId, kind: 'current', fileId: info.fileId, size: info.size, updatedAt: info.updatedAt, revived: false, created: true };
+  }
+
+  async quarantine(token: string, name: string, body: Readable, _opts: { contentLength: number | undefined }, ctx: CallContext): Promise<void> {
+    this.record('quarantine', ctx, name);
+    if (!this.revokedTokens.has(token)) {
+      body.resume();
+      throw new GatewayError(401, { error: 'session_invalid', reason: 'unknown' }, 'unknown');
+    }
+    this.quarantined.push({ token, name, content: await readAll(body) });
+  }
+
+  /** Tokens that resolve to 401 revoked but whose saves may still be quarantined. */
+  readonly revokedTokens = new Set<string>();
+  /** Revoked session id -> its token, for calls that arrive with a cached session. */
+  readonly revokedSessions = new Map<string, string>();
+
+  /** Like revokeSession on the gateway: the token stops resolving and the session's locks go. */
+  revoke(token: string): void {
+    const session = this.sessions.get(token);
+    this.sessions.delete(token);
+    this.revokedTokens.add(token);
+    if (!session) return;
+    this.revokedSessions.set(session.sessionId, token);
+    for (const file of this.files.values()) {
+      if (file.info.lock?.sessionId === session.sessionId) file.info.lock = null;
+    }
   }
 
   async lock(req: LockRequest, ctx: CallContext): Promise<LockResponse> {

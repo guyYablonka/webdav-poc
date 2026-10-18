@@ -168,16 +168,18 @@ describe('failure paths', () => {
     expect((await demo.files(alice)).find((f) => f.id === fileId)!.lock?.user.id).toBe('alice');
   });
 
-  it('a PUT without a lock gets 423', async () => {
+  // Real Word reports every refused PUT as a successful save and drops the
+  // edits, so saves are kept aside (conflict version or quarantine) and get 204.
+  it('a PUT without a lock, or with a foreign token, is kept as a conflict version', async () => {
     const fileId = await newFile('NoLock.docx');
     const { davUrl } = await openForEdit(alice, fileId);
-    expect((await dav('PUT', davUrl, { body: 'x' })).status).toBe(423);
-    // ...and a lock token that is not the file's lock is refused too.
-    expect((await dav('PUT', davUrl, { headers: { if: '(<opaquelocktoken:bogus>)' }, body: 'x' })).status).toBe(412);
-    expect((await demo.file(alice, fileId)).versionCount).toBe(1);
+    expect((await dav('PUT', davUrl, { body: 'x' })).status).toBe(204);
+    expect((await dav('PUT', davUrl, { headers: { if: '(<opaquelocktoken:bogus>)' }, body: 'y' })).status).toBe(204);
+    const detail = await demo.file(alice, fileId);
+    expect(detail.versions.map((v) => v.source)).toEqual(['conflict', 'conflict', 'web']);
   });
 
-  it('a revoked session gets 401, and a save fails cleanly', async () => {
+  it('a revoked session’s save is quarantined; reads still get 401', async () => {
     const fileId = await newFile('Revoked.docx');
     const { davUrl, sessionId } = await openForEdit(alice, fileId);
     const { token: lockToken } = await lock(davUrl);
@@ -186,14 +188,44 @@ describe('failure paths', () => {
     expect(await demo.revoke(alice, sessionId)).toBe(204);
 
     const put = await dav('PUT', davUrl, { headers: { if: `(<${lockToken}>)` }, body: 'after revoke' });
-    expect(put.status).toBe(401);
-    expect(header(put, 'www-authenticate')).toMatch(/^Bearer /);
+    expect(put.status).toBe(204);
     expect((await dav('PROPFIND', davUrl, { headers: { depth: '0' } })).status).toBe(401);
     expect((await dav('GET', davUrl)).status).toBe(401);
     expect((await dav('LOCK', davUrl, { headers: { if: `(<${lockToken}>)` } })).status).toBe(401);
+    // Word UNLOCKs on close; the lock already went with the session.
+    expect((await dav('UNLOCK', davUrl, { headers: { 'lock-token': `<${lockToken}>` } })).status).toBe(204);
     const detail = await demo.file(alice, fileId);
     expect(detail.versionCount).toBe(1);
     expect(detail.lock).toBeNull();
+    const kept = (await demo.quarantine(alice)).filter((q) => q.sessionId === sessionId);
+    expect(kept).toEqual([expect.objectContaining({ fileId, fileName: 'Revoked.docx', reason: 'revoked', size: 12 })]);
+  });
+
+  it('a PUT with an unknown token still gets 401', async () => {
+    const fileId = await newFile('Stranger.docx');
+    const put = await dav('PUT', `${stack.davUrl}/s/not-a-real-token/${fileId}/Stranger.docx`, { body: 'x' });
+    expect(put.status).toBe(401);
+    expect(header(put, 'www-authenticate')).toMatch(/^Bearer /);
+  });
+
+  it('Save As to a new name creates a file that later saves land on', async () => {
+    const fileId = await newFile('Original.docx');
+    const { davUrl } = await openForEdit(alice, fileId);
+    const { token: lockToken } = await lock(davUrl);
+    const copyUrl = `${davUrl.slice(0, davUrl.lastIndexOf('/') + 1)}${encodeURIComponent('Original copy.docx')}`;
+    // Observed Word sequence: HEAD 404, PUT without If, LOCK the new name, UNLOCK the original.
+    // A failed LOCK here makes Word DELETE the new file, so it must get 200.
+    expect((await dav('HEAD', copyUrl)).status).toBe(404);
+    expect((await dav('PUT', copyUrl, { body: 'first' })).status).toBe(201);
+    const { res: copyLockRes, token: copyLock } = await lock(copyUrl);
+    expect(copyLockRes.status).toBe(200);
+    expect((await dav('UNLOCK', davUrl, { headers: { 'lock-token': `<${lockToken}>` } })).status).toBe(204);
+    expect((await dav('PUT', copyUrl, { headers: { if: `(<${copyLock}>)` }, body: 'second' })).status).toBe(204);
+    expect((await dav('GET', copyUrl)).text).toBe('second');
+
+    const copy = (await demo.files(alice)).find((f) => f.name === 'Original copy.docx')!;
+    expect(copy.versionCount).toBe(2);
+    expect((await demo.file(alice, fileId)).versionCount).toBe(1);
   });
 
   it('logging out revokes the user’s DAV sessions', async () => {
@@ -225,7 +257,7 @@ describe('failure paths', () => {
     events.close();
   });
 
-  it('an expired lock where another session saved in between gets 412', async () => {
+  it('an expired lock where another session saved in between keeps the late save as a conflict', async () => {
     const fileId = await newFile('Overtaken.docx');
     const a = await openForEdit(alice, fileId);
     const { token: aliceLock } = await lock(a.davUrl);
@@ -238,18 +270,35 @@ describe('failure paths', () => {
     expect((await dav('UNLOCK', b.davUrl, { headers: { 'lock-token': `<${bobLock}>` } })).status).toBe(204);
 
     const res = await dav('PUT', a.davUrl, { headers: { if: `(<${aliceLock}>)` }, body: 'alice is late' });
-    expect(res.status).toBe(412);
+    expect(res.status).toBe(204);
     const detail = await demo.file(alice, fileId);
-    expect(detail.versionCount).toBe(2);
-    expect(detail.versions[0]!.createdBy.id).toBe('bob');
+    // Bob's save stays current; Alice's is kept beside it, not lost.
+    expect((await dav('GET', b.davUrl)).text).toBe('bob wins');
+    expect(detail.versions.map((v) => [v.source, v.createdBy.id])).toEqual([
+      ['conflict', 'alice'],
+      ['dav', 'bob'],
+      ['web', 'alice'],
+    ]);
   });
 
-  it('force unlock makes the next save fail with 412', async () => {
+  it('a save after a force unlock is kept as a conflict version', async () => {
     const fileId = await newFile('Forced.docx');
     const { davUrl } = await openForEdit(alice, fileId);
     const { token: lockToken } = await lock(davUrl);
     expect(await demo.forceUnlock(bob, fileId)).toBe(204);
-    expect((await dav('PUT', davUrl, { headers: { if: `(<${lockToken}>)` }, body: 'x' })).status).toBe(412);
+    expect((await dav('PUT', davUrl, { headers: { if: `(<${lockToken}>)` }, body: 'x' })).status).toBe(204);
+    expect((await demo.file(alice, fileId)).versions[0]!.source).toBe('conflict');
+  });
+
+  it('the same user reopening after a crash takes over their own lock', async () => {
+    const fileId = await newFile('Crashed.docx');
+    const crashed = await openForEdit(alice, fileId);
+    expect((await lock(crashed.davUrl)).res.status).toBe(200);
+    const reopened = await openForEdit(alice, fileId);
+    const { res, token } = await lock(reopened.davUrl);
+    expect(res.status).toBe(200);
+    expect((await dav('PUT', reopened.davUrl, { headers: { if: `(<${token}>)` }, body: 'after crash' })).status).toBe(204);
+    expect((await demo.file(alice, fileId)).versions[0]!.source).toBe('dav');
   });
 
   it('a web upload while locked gets 409', async () => {
@@ -290,7 +339,7 @@ describe('failure paths', () => {
     expect((await dav('HEAD', lenient)).status).toBe(200);
   });
 
-  it('streams a large PUT, and refuses one with the wrong token promptly', async () => {
+  it('streams a large PUT, and keeps one with the wrong token as a conflict', async () => {
     const fileId = await newFile('Large.xlsx');
     const { davUrl } = await openForEdit(alice, fileId);
     const { token: lockToken } = await lock(davUrl);
@@ -301,11 +350,12 @@ describe('failure paths', () => {
     res = await dav('GET', davUrl);
     expect(res.body.length).toBe(big.length);
 
-    // The gateway refuses before reading the body (the file is locked under another token).
-    const started = Date.now();
+    // A stale token no longer gets an early refusal: the whole body is stored as a conflict.
     res = await dav('PUT', davUrl, { headers: { if: '(<opaquelocktoken:stale>)' }, body: big });
-    expect(res.status).toBe(423);
-    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(res.status).toBe(204);
+    const versions = (await demo.file(alice, fileId)).versions;
+    expect(versions.map((v) => v.source)).toEqual(['conflict', 'dav', 'web']);
+    expect((await dav('GET', davUrl)).body.length).toBe(big.length);
     // The connection survives: the next request still works.
     expect((await dav('HEAD', davUrl)).status).toBe(200);
   });

@@ -82,7 +82,11 @@
   }
 
   const DESCRIBE = {
-    'version.created': (e) => `v${e.versionNo} saved by ${e.userId} (${e.source})`,
+    'version.created': (e) =>
+      e.source === 'conflict'
+        ? `v${e.versionNo} saved by ${e.userId} as a CONFLICT copy (their lock was gone); not current`
+        : `v${e.versionNo} saved by ${e.userId} (${e.source})`,
+    'upload.quarantined': (e) => `save by ${e.userId} quarantined (${e.reason.replace('_', ' ')}); see admin`,
     'lock.acquired': (e) => `locked by ${e.userId}`,
     'lock.refreshed': (e) => `lock refreshed by ${e.userId}`,
     'lock.revived': (e) => `expired lock revived for ${e.userId}`,

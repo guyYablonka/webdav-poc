@@ -111,6 +111,42 @@ export function gatewayRoutes(deps: GatewayDeps): FastifyPluginAsync {
         body: req.raw,
       });
       if (result.revived) req.log.info({ fileId: req.params.fileId }, 'lock revived by PUT');
+      if (result.kind !== 'current') req.log.warn({ fileId: req.params.fileId, kind: result.kind }, 'DAV save stored aside');
+      return reply.code(201).send(result);
+    });
+
+    // Save As support: a file this session created, looked up by the name in Office's URL.
+    app.get<{ Params: { sessionId: string; name: string } }>('/sessions/:sessionId/files/:name', async (req): Promise<FileInfo> => {
+      policy.requireSession(req.params.sessionId);
+      const fileId = policy.findSessionFile(req.params.sessionId, req.params.name);
+      if (!fileId) throw new PolicyError(404, 'not_found', 'no such file in this session');
+      return files.fileInfo(fileId);
+    });
+
+    app.put<{ Params: { sessionId: string; name: string } }>('/sessions/:sessionId/files/:name/content', async (req, reply) => {
+      const lengthHeader = header(req, 'content-length');
+      const result = await files.saveAsFromDav({
+        sessionId: req.params.sessionId,
+        name: req.params.name,
+        contentLength: lengthHeader === undefined ? undefined : Number(lengthHeader),
+        body: req.raw,
+      });
+      req.log.info({ fileId: result.fileId, kind: result.kind, created: result.created }, 'save as from DAV');
+      return reply.code(201).send(result);
+    });
+
+    // A save whose token no longer resolves. Keyed by the raw token because there is no live session.
+    app.put('/quarantine', async (req, reply) => {
+      const token = header(req, GatewayHeaders.davToken);
+      if (!token) throw new PolicyError(400, 'bad_request', 'X-Dav-Token is required');
+      let fileName = header(req, GatewayHeaders.davFileName) ?? '';
+      try {
+        fileName = decodeURIComponent(fileName);
+      } catch {
+        // Keep the raw value; it is only a label for the admin.
+      }
+      const result = await files.quarantineFromDav({ token, fileName, body: req.raw });
+      req.log.warn({ quarantineId: result.quarantineId }, 'DAV save quarantined (session no longer valid)');
       return reply.code(201).send(result);
     });
 

@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS file_versions (
   sha256          TEXT NOT NULL,
   created_by      TEXT NOT NULL REFERENCES users(id),
   created_at      INTEGER NOT NULL,
-  source          TEXT NOT NULL CHECK (source IN ('seed', 'web', 'dav')),
+  source          TEXT NOT NULL CHECK (source IN ('seed', 'web', 'dav', 'conflict')),
   dav_session_id  TEXT REFERENCES dav_sessions(id),
   UNIQUE (file_id, version_no)
 );
@@ -64,6 +64,31 @@ CREATE TABLE IF NOT EXISTS file_locks (
   timeout_s        INTEGER NOT NULL,
   expires_at       INTEGER NOT NULL,
   created_at       INTEGER NOT NULL
+);
+
+-- Files a DAV session created with Save As. They live in the session's URL
+-- collection next to the original, so Office can keep saving to them.
+CREATE TABLE IF NOT EXISTS dav_session_files (
+  session_id  TEXT NOT NULL REFERENCES dav_sessions(id),
+  file_id     TEXT NOT NULL REFERENCES files(id),
+  name        TEXT NOT NULL,
+  created_at  INTEGER NOT NULL,
+  PRIMARY KEY (session_id, file_id)
+);
+
+-- Saves that could not be stored as a version (see SaveKind 'quarantined').
+-- Admin-only; the bytes are kept so nothing Office reported as saved is lost.
+CREATE TABLE IF NOT EXISTS dav_quarantine (
+  id          TEXT PRIMARY KEY,
+  session_id  TEXT NOT NULL REFERENCES dav_sessions(id),
+  user_id     TEXT NOT NULL REFERENCES users(id),
+  file_id     TEXT REFERENCES files(id),
+  file_name   TEXT NOT NULL,
+  reason      TEXT NOT NULL,
+  blob_key    TEXT NOT NULL,
+  size        INTEGER NOT NULL,
+  sha256      TEXT NOT NULL,
+  created_at  INTEGER NOT NULL
 );
 `;
 

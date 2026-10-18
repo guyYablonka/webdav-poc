@@ -132,6 +132,19 @@ describe('lock acquire', () => {
     expect(err.details.heldBy).toEqual({ userId: 'alice', displayName: 'Alice', since: new Date(w.now()).toISOString() });
   });
 
+  it('lets the same user take over the lock from their own dead session', async () => {
+    const w = await createWorld();
+    const crashed = w.session('alice');
+    const reopened = w.session('alice');
+    const old = w.acquire(crashed.session.id);
+    const res = w.acquire(reopened.session.id);
+    expect(res.lockToken).not.toBe(old.lockToken);
+    expect(w.repo.getLock(w.file.id)!.session_id).toBe(reopened.session.id);
+    expect(w.published.at(-1)).toMatchObject({ type: 'lock.acquired', tookOverFrom: crashed.session.id });
+    // If the old session was alive after all, its next save is kept aside, not lost.
+    expect((await w.put(crashed.session.id, old.lockToken)).kind).toBe('conflict');
+  });
+
   it('refuses a new lock from the holder itself while it is active', async () => {
     const w = await createWorld();
     const { session } = w.session();
@@ -281,10 +294,26 @@ describe('unlock', () => {
 });
 
 describe('PUT', () => {
-  it('requires a lock token', async () => {
+  // Office reports every refused PUT as a successful save (observed with Word
+  // 16.0.19127), so a known session's save is never refused: it is stored as
+  // current, as a conflict side-version, or in quarantine.
+  it('stores a save without a lock token as a conflict version, not the current one', async () => {
     const w = await createWorld();
     const { session } = w.session();
-    expect((await refusal(() => w.put(session.id, undefined))).status).toBe(423);
+    const res = await w.put(session.id, undefined, 'no lock');
+    expect(res.kind).toBe('conflict');
+    expect(w.repo.getFile(w.file.id)!.current_version_id).toBe(w.file.current_version_id);
+    expect(w.repo.getVersion(res.versionId)).toMatchObject({ source: 'conflict', created_by: 'alice', dav_session_id: session.id });
+    expect(w.published.at(-1)).toMatchObject({ type: 'version.created', source: 'conflict' });
+  });
+
+  it('accepts a save without an If header when the session holds the lock', async () => {
+    const w = await createWorld();
+    const { session } = w.session();
+    w.acquire(session.id);
+    const res = await w.put(session.id, undefined, 'edited');
+    expect(res.kind).toBe('current');
+    expect(w.repo.getFile(w.file.id)!.current_version_id).toBe(res.versionId);
   });
 
   it('saves under an active lock: new version, base version and expiry move forward', async () => {
@@ -336,33 +365,64 @@ describe('PUT', () => {
     expect(w.published.map((e) => e.type)).toEqual(['lock.acquired', 'lock.revived', 'version.created']);
   });
 
-  it('refuses with 412 when another session saved after the lock expired', async () => {
+  it('keeps a save as a conflict when another session saved after the lock expired', async () => {
     const w = await createWorld();
     const alice = w.session('alice');
     const bob = w.session('bob');
     const aliceLock = w.acquire(alice.session.id);
     w.advance(LOCK_MAX_TIMEOUT_S + 1);
     const bobLock = w.acquire(bob.session.id);
-    await w.put(bob.session.id, bobLock.lockToken, 'bob');
+    const bobSave = await w.put(bob.session.id, bobLock.lockToken, 'bob');
     w.policy.unlock(bobLock.lockToken, bob.session.id);
-    expect((await refusal(() => w.put(alice.session.id, aliceLock.lockToken))).status).toBe(412);
+    const res = await w.put(alice.session.id, aliceLock.lockToken, 'alice late');
+    expect(res.kind).toBe('conflict');
+    expect(w.repo.getFile(w.file.id)!.current_version_id).toBe(bobSave.versionId);
   });
 
-  it('refuses with 423 while another session holds the lock', async () => {
+  it('keeps a save as a conflict while another session holds the lock, and leaves that lock alone', async () => {
     const w = await createWorld();
     const alice = w.session('alice');
     const bob = w.session('bob');
-    w.acquire(alice.session.id);
-    const err = await refusal(() => w.put(bob.session.id, 'opaquelocktoken:bogus'));
-    expect(err.status).toBe(423);
+    const { lockToken } = w.acquire(alice.session.id);
+    const res = await w.put(bob.session.id, 'opaquelocktoken:bogus');
+    expect(res.kind).toBe('conflict');
+    expect(w.repo.getLock(w.file.id)!.lock_token).toBe(lockToken);
   });
 
-  it('refuses revoked sessions with 401', async () => {
+  it('keeps a save after a force unlock as a conflict', async () => {
+    const w = await createWorld();
+    const { session } = w.session();
+    const { lockToken } = w.acquire(session.id);
+    w.policy.forceUnlock(w.file.id);
+    expect((await w.put(session.id, lockToken)).kind).toBe('conflict');
+  });
+
+  it('quarantines a revoked session’s save instead of refusing it', async () => {
     const w = await createWorld();
     const { session } = w.session();
     const { lockToken } = w.acquire(session.id);
     w.policy.revokeSession(session.id);
-    expect((await refusal(() => w.put(session.id, lockToken))).details.reason).toBe('revoked');
+    const res = await w.put(session.id, lockToken, 'late edits');
+    expect(res.kind).toBe('quarantined');
+    expect(w.repo.listVersions(w.file.id)).toHaveLength(1);
+    const [q] = w.policy.listQuarantine();
+    expect(q).toMatchObject({ session_id: session.id, user_id: 'alice', file_id: w.file.id, file_name: 'Plan.docx', reason: 'revoked', size: 10 });
+    expect(existsSync(join(w.dir, 'blobs', q!.blob_key))).toBe(true);
+    expect(w.published.at(-1)).toMatchObject({ type: 'upload.quarantined', reason: 'revoked' });
+  });
+
+  it('quarantines a save from a session past its cap', async () => {
+    const w = await createWorld();
+    const { session } = w.session();
+    const { lockToken } = w.acquire(session.id);
+    w.advance(TOKEN_MAX_AGE_S);
+    expect((await w.put(session.id, lockToken)).kind).toBe('quarantined');
+    expect(w.policy.listQuarantine()[0]!.reason).toBe('beyond_cap');
+  });
+
+  it('still refuses an unknown session id', async () => {
+    const w = await createWorld();
+    expect((await refusal(() => w.put('no-such-session', undefined))).status).toBe(401);
   });
 
   it('refuses uploads over MAX_UPLOAD_MB and keeps no blob', async () => {
@@ -377,7 +437,7 @@ describe('PUT', () => {
     expect(readdirSync(join(w.dir, 'blobs', w.file.id))).toHaveLength(1);
   });
 
-  it('re-checks the lock after the upload and deletes the orphaned blob', async () => {
+  it('re-checks the lock after the upload: a lock lost mid-upload gives a conflict, not the current version', async () => {
     const w = await createWorld();
     const { session } = w.session();
     const { lockToken } = w.acquire(session.id);
@@ -389,13 +449,10 @@ describe('PUT', () => {
         this.push(null);
       },
     });
-    const err = await refusal(() =>
-      w.files.saveFromDav({ fileId: w.file.id, sessionId: session.id, lockToken, contentLength: 4, body: upload }),
-    );
-    expect(err.status).toBe(412);
-    await new Promise((r) => setTimeout(r, 20));
-    expect(readdirSync(join(w.dir, 'blobs', w.file.id))).toHaveLength(1);
-    expect(w.repo.listVersions(w.file.id)).toHaveLength(1);
+    const res = await w.files.saveFromDav({ fileId: w.file.id, sessionId: session.id, lockToken, contentLength: 4, body: upload });
+    expect(res.kind).toBe('conflict');
+    expect(w.repo.getFile(w.file.id)!.current_version_id).toBe(w.file.current_version_id);
+    expect(readdirSync(join(w.dir, 'blobs', w.file.id))).toHaveLength(2);
   });
 
   it('writes every version as a new immutable blob', async () => {
@@ -405,6 +462,69 @@ describe('PUT', () => {
     const res = await w.put(session.id, lockToken, 'v2');
     expect(existsSync(join(w.dir, 'blobs', w.file.id, w.file.current_version_id!))).toBe(true);
     expect(existsSync(join(w.dir, 'blobs', w.file.id, res.versionId))).toBe(true);
+  });
+});
+
+describe('Save As', () => {
+  // Word's Save As to the DAV folder: HEAD 404, then a PUT to the new name with
+  // no LOCK and no If header (observed). Refusing it made Word re-point the
+  // document at the new URL and lose every later save.
+  it('creates an unlocked file owned by the user that the session can then lock and save', async () => {
+    const w = await createWorld();
+    const { session } = w.session();
+    const created = await w.files.saveAsFromDav({ sessionId: session.id, name: 'Plan v2.docx', contentLength: 2, body: body('v2') });
+    expect(created).toMatchObject({ kind: 'current', created: true });
+    const file = w.repo.getFile(created.fileId)!;
+    expect(file).toMatchObject({ name: 'Plan v2.docx', updated_by: 'alice' });
+    // Word LOCKs the new name right after the PUT; a server-held lock made that 423.
+    expect(w.repo.getLock(created.fileId)).toBeUndefined();
+    expect(w.policy.findSessionFile(session.id, 'plan V2.docx')).toBe(created.fileId);
+
+    const { lockToken } = w.acquire(session.id, created.fileId);
+    expect((await w.put(session.id, lockToken, 'second', created.fileId)).kind).toBe('current');
+    // A PUT to the same name again (Save As over it) also goes to that file, under the lock.
+    const again = await w.files.saveAsFromDav({ sessionId: session.id, name: 'Plan v2.docx', contentLength: 5, body: body('again') });
+    expect(again).toMatchObject({ kind: 'current', created: false, fileId: created.fileId });
+    expect(w.repo.listVersions(created.fileId)).toHaveLength(3);
+  });
+
+  it('quarantines a Save As to a name that is not an Office file', async () => {
+    const w = await createWorld();
+    const { session } = w.session();
+    const res = await w.files.saveAsFromDav({ sessionId: session.id, name: 'Plan.pdf', contentLength: 1, body: body('x') });
+    expect(res.kind).toBe('quarantined');
+    expect(w.policy.listQuarantine()[0]).toMatchObject({ reason: 'unsupported_name', file_name: 'Plan.pdf' });
+    expect(w.repo.countFiles()).toBe(1);
+  });
+
+  it('quarantines a Save As from a revoked session', async () => {
+    const w = await createWorld();
+    const { session } = w.session();
+    w.policy.revokeSession(session.id);
+    const res = await w.files.saveAsFromDav({ sessionId: session.id, name: 'Plan v2.docx', contentLength: 1, body: body('x') });
+    expect(res.kind).toBe('quarantined');
+    expect(w.repo.countFiles()).toBe(1);
+  });
+});
+
+describe('quarantine by token', () => {
+  it('keeps the body of a save whose token was revoked', async () => {
+    const w = await createWorld();
+    const { token, session } = w.session();
+    w.policy.revokeSession(session.id);
+    const { quarantineId } = await w.files.quarantineFromDav({ token, fileName: 'Plan.docx', body: body('late') });
+    expect(w.policy.listQuarantine()).toEqual([expect.objectContaining({ id: quarantineId, session_id: session.id, reason: 'revoked', size: 4 })]);
+  });
+
+  it('refuses an unknown token and keeps no blob', async () => {
+    const w = await createWorld();
+    const err = await refusal(() => w.files.quarantineFromDav({ token: 'nope', fileName: 'Plan.docx', body: body('x') }));
+    expect(err.status).toBe(401);
+    expect(w.policy.listQuarantine()).toEqual([]);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(existsSync(join(w.dir, 'blobs', 'quarantine', 'by-token'))
+      ? readdirSync(join(w.dir, 'blobs', 'quarantine', 'by-token'))
+      : []).toEqual([]);
   });
 });
 

@@ -91,6 +91,7 @@ button.link { background: none; border: none; color: var(--accent); cursor: poin
 .badge.locked { background: var(--warn-bg); color: var(--warn-text); }
 .source { font-size: 0.75rem; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--border); color: var(--muted); }
 .source.dav { border-color: var(--accent); color: var(--accent); }
+.source.conflict { border-color: #c2410c; color: #c2410c; font-weight: 600; }
 
 .admin { display: grid; gap: 12px; justify-items: start; }
 .preview { max-height: 600px; overflow: auto; border: 1px solid var(--border); border-radius: 6px; padding: 12px; background: var(--bg); }

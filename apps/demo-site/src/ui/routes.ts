@@ -161,6 +161,21 @@ export function uiRoutes(deps: UiDeps): FastifyPluginAsync {
       return reply.code(204).send();
     });
 
+    /** Saves kept aside because their session could no longer write (no download here; admin tooling's job). */
+    app.get('/api/admin/quarantine', async () =>
+      policy.listQuarantine().map((q) => ({
+        id: q.id,
+        sessionId: q.session_id,
+        userId: q.user_id,
+        fileId: q.file_id,
+        fileName: q.file_name,
+        reason: q.reason,
+        size: q.size,
+        sha256: q.sha256,
+        createdAt: new Date(q.created_at).toISOString(),
+      })),
+    );
+
     app.post<{ Params: { id: string } }>('/api/sessions/:id/revoke', async (req, reply) => {
       const revoked = policy.revokeSession(req.params.id);
       req.log.info({ sessionId: req.params.id, by: user(req).id, revoked }, 'revoke session');

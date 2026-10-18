@@ -8,10 +8,27 @@ export type DemoEvent =
       versionId: string;
       versionNo: number;
       userId: string;
-      source: 'seed' | 'web' | 'dav';
+      source: 'seed' | 'web' | 'dav' | 'conflict';
       at: string;
     }
-  | { type: 'lock.acquired'; fileId: string; userId: string; sessionId: string; expiresAt: string; at: string }
+  | {
+      type: 'upload.quarantined';
+      fileId: string | null;
+      userId: string;
+      sessionId: string;
+      reason: string;
+      at: string;
+    }
+  | {
+      type: 'lock.acquired';
+      fileId: string;
+      userId: string;
+      sessionId: string;
+      expiresAt: string;
+      at: string;
+      /** Set when the same user's newer session took over an older session's lock (crash recovery). */
+      tookOverFrom?: string;
+    }
   | { type: 'lock.refreshed'; fileId: string; userId: string; sessionId: string; expiresAt: string; at: string }
   | { type: 'lock.revived'; fileId: string; userId: string; sessionId: string; expiresAt: string; at: string }
   | {
@@ -28,6 +45,7 @@ export type DemoEventType = DemoEvent['type'];
 
 export const EVENT_TYPES: readonly DemoEventType[] = [
   'version.created',
+  'upload.quarantined',
   'lock.acquired',
   'lock.refreshed',
   'lock.revived',
